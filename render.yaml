@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: nodera-identity
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DATABASE
+        value: nodera
+      - key: AUTH_RATE_SECRET
+        generateValue: true
+      - key: TRUST_PROXY
+        value: "1"
