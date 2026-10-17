@@ -199,6 +199,7 @@ var MarketplaceStore = class {
       memory: Number(body.memory),
       storage: Number(body.storage),
       network: Number(body.network),
+      ...typeof body.cpuModel === "string" && body.cpuModel.trim().length > 0 && body.cpuModel.length <= 200 && !/[\x00-\x1f\x7f]/.test(body.cpuModel) ? { cpuModel: body.cpuModel.trim() } : {},
       published: true,
       updatedAt: /* @__PURE__ */ new Date()
     };
@@ -323,6 +324,7 @@ var MarketplaceStore = class {
       memory: listing.memory,
       storage: listing.storage,
       network: listing.network,
+      ...listing.cpuModel ? { cpuModel: listing.cpuModel } : {},
       published: listing.published,
       resetRequired: listing.resetRequired,
       online,
@@ -800,11 +802,14 @@ function createRentalRelay(server, accounts, rateSecret) {
     stop,
     market,
     async handle(user, method, pathname, body, params = new URLSearchParams()) {
-      const publicItem = (item) => market.public(
-        item,
-        online(item),
-        item.ownerId === user.id || item.lease?.guestId === user.id
-      );
+      const publicItem = (item) => ({
+        ...market.public(
+          item,
+          online(item),
+          item.ownerId === user.id || item.lease?.guestId === user.id
+        ),
+        ...online(item) ? { availabilityCheckedAt: new Date(peerFor(item).seen).toISOString() } : {}
+      });
       if (method === "GET" && pathname === "/v1/marketplace") {
         let filters;
         try {
