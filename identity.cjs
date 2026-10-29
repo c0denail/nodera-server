@@ -1083,7 +1083,7 @@ function createRentalRelay(server, accounts, rateSecret, directory) {
           ownerId: { $ne: user.id },
           lease: null,
           resetRequired: false,
-          _id: { $in: [...credentials2.keys()] },
+          ...directory ? { directoryGeneration: { $type: "string" } } : { _id: { $in: [...credentials2.keys()] } },
           $or: readyHosts.length ? readyHosts : [{ _id: "no-online-host" }]
         };
         for (const resource of marketResources) {
@@ -1245,7 +1245,7 @@ function createIdentityServer(store, options) {
           status: "ok",
           service: "nodera-identity",
           version: "0.5.0",
-          capabilities: ["marketplace", "rdp-relay", ...directory ? ["directory-v1"] : []]
+          capabilities: ["marketplace", "rdp-relay", ...directory ? ["directory-v1", "directory-marketplace-v1"] : []]
         });
         return;
       }
