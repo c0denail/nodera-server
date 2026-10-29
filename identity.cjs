@@ -23,8 +23,8 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 
 // apps/api/src/store.ts
-var import_node_crypto3 = require("node:crypto");
-var import_mongodb2 = require("mongodb");
+var import_node_crypto4 = require("node:crypto");
+var import_mongodb3 = require("mongodb");
 
 // packages/shared/src/errors.ts
 var HttpError = class extends Error {
@@ -201,6 +201,7 @@ var MarketplaceStore = class {
       network: Number(body.network),
       ...typeof body.cpuModel === "string" && body.cpuModel.trim().length > 0 && body.cpuModel.length <= 200 && !/[\x00-\x1f\x7f]/.test(body.cpuModel) ? { cpuModel: body.cpuModel.trim() } : {},
       published: true,
+      ...typeof body.directoryGeneration === "string" && uuid.test(body.directoryGeneration) ? { directoryGeneration: body.directoryGeneration, autoPublish: true } : {},
       updatedAt: /* @__PURE__ */ new Date()
     };
     if (existing) {
@@ -229,13 +230,14 @@ var MarketplaceStore = class {
     }
     return listing;
   }
-  async reserve(user, id) {
+  async reserve(user, id, durationMinutes) {
     const lease = {
       id: (0, import_node_crypto2.randomUUID)(),
       guestId: user.id,
       guestName: user.name,
       phase: "reserved",
-      expiresAt: new Date(Date.now() + 12e4)
+      expiresAt: new Date(Date.now() + 12e4),
+      ...durationMinutes ? { durationMinutes } : {}
     };
     try {
       const result = await this.listings.findOneAndUpdate(
@@ -291,7 +293,7 @@ var MarketplaceStore = class {
         { upsert: true }
       );
   }
-  async reset(ownerId, deviceId, id, leaseId) {
+  async reset(ownerId, deviceId, id, leaseId, directoryGeneration, republish = false) {
     const result = await this.listings.updateOne(
       {
         _id: id,
@@ -305,7 +307,8 @@ var MarketplaceStore = class {
         $set: {
           lease: null,
           resetRequired: false,
-          published: false,
+          published: republish,
+          ...directoryGeneration ? { directoryGeneration } : {},
           updatedAt: /* @__PURE__ */ new Date()
         }
       }
@@ -325,6 +328,7 @@ var MarketplaceStore = class {
       storage: listing.storage,
       network: listing.network,
       ...listing.cpuModel ? { cpuModel: listing.cpuModel } : {},
+      ...listing.directoryGeneration ? { domainAccount: true } : {},
       published: listing.published,
       resetRequired: listing.resetRequired,
       online,
@@ -334,6 +338,244 @@ var MarketplaceStore = class {
         expiresAt: listing.lease.expiresAt.toISOString()
       } : null
     };
+  }
+};
+
+// apps/api/src/directory.ts
+var import_node_crypto3 = require("node:crypto");
+var import_mongodb2 = require("mongodb");
+
+// packages/shared/src/directory.ts
+var directoryUuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+var windowsUsername = /^[a-z][a-z0-9_-]{2,19}$/;
+
+// apps/api/src/directory.ts
+function directoryOptions(env = process.env) {
+  if (env.NODERA_DIRECTORY_ENABLED !== "true") return;
+  const value = {
+    enabled: true,
+    domain: env.NODERA_AD_DOMAIN ?? "ad.nodera.test",
+    netbios: env.NODERA_AD_NETBIOS ?? "NODERA",
+    dnsServer: env.NODERA_AD_DNS ?? "100.90.52.46",
+    computerOU: env.NODERA_AD_COMPUTER_OU ?? "OU=Computers,OU=Nodera,DC=ad,DC=nodera,DC=test",
+    msiUrl: env.NODERA_TAILSCALE_MSI_URL ?? "",
+    msiSha256: (env.NODERA_TAILSCALE_MSI_SHA256 ?? "").toLowerCase(),
+    agentToken: env.NODERA_AD_AGENT_TOKEN ?? "",
+    dataKey: env.NODERA_AD_DATA_KEY ?? ""
+  };
+  if (!/^[a-f0-9]{64}$/.test(value.dataKey) || !/^[a-f0-9]{64}$/.test(value.agentToken) || !/^[a-f0-9]{64}$/i.test(value.msiSha256) || !/^https:\/\/pkgs\.tailscale\.com\/stable\/tailscale-setup-[\d.]+-amd64\.msi$/.test(value.msiUrl) || !/^[a-z0-9.-]+$/.test(value.domain) || !/^[A-Z0-9_-]{1,15}$/.test(value.netbios) || !/^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/.test(value.dnsServer))
+    throw new Error("AD yap\u0131land\u0131rmas\u0131 eksik veya ge\xE7ersiz. NODERA_AD_* ve Tailscale paket ayarlar\u0131n\u0131 kontrol edin.");
+  return value;
+}
+async function initializeDirectory(db) {
+  await db.collection("directory_machines").createIndex({ computerName: 1 }, { unique: true });
+  await db.collection("directory_accounts").createIndex({ username: 1 }, { unique: true });
+  await db.collection("directory_jobs").createIndex({ status: 1, createdAt: 1 });
+  await db.collection("directory_jobs").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+}
+var DirectoryService = class {
+  constructor(db, options) {
+    this.db = db;
+    this.options = options;
+    this.machines = db.collection("directory_machines");
+    this.jobs = db.collection("directory_jobs");
+    this.accounts = db.collection("directory_accounts");
+  }
+  db;
+  options;
+  machines;
+  jobs;
+  accounts;
+  config() {
+    const { agentToken: _token, dataKey: _key, ...config } = this.options;
+    return config;
+  }
+  async agentOnline() {
+    const agent = await this.db.collection("directory_agent").findOne({ name: "dc1" });
+    return agent?.seenAt instanceof Date && agent.seenAt.getTime() > Date.now() - 12e4;
+  }
+  seal(value) {
+    const iv = (0, import_node_crypto3.randomBytes)(12), cipher = (0, import_node_crypto3.createCipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), iv);
+    return Buffer.concat([iv, cipher.update(JSON.stringify(value)), cipher.final(), cipher.getAuthTag()]).toString("base64");
+  }
+  open(value) {
+    const data = Buffer.from(value, "base64"), decipher = (0, import_node_crypto3.createDecipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), data.subarray(0, 12));
+    decipher.setAuthTag(data.subarray(-16));
+    return JSON.parse(Buffer.concat([decipher.update(data.subarray(12, -16)), decipher.final()]).toString("utf8"));
+  }
+  async enqueue(kind, ownerId, payload, machine, id = (0, import_node_crypto3.randomUUID)()) {
+    const job = { _id: id, kind, ownerId, ...machine ? { machineId: machine.machineId, generation: machine.generation } : {}, encrypted: this.seal(payload), status: "queued", createdAt: /* @__PURE__ */ new Date(), expiresAt: new Date(Date.now() + 30 * 6e4) };
+    await this.jobs.insertOne(job);
+    return id;
+  }
+  publicMachine(doc) {
+    const { machineId, deviceId, generation, computerName, phase, jobId, group, error } = doc;
+    return { machineId, deviceId, generation, computerName, phase, jobId, ...group ? { group } : {}, ...error ? { error } : {} };
+  }
+  async owned(userId, machineId) {
+    let value = await this.machines.findOne({ _id: machineId, ownerId: userId });
+    if (!value) throw new HttpError(404, "VM'nin domain haz\u0131rl\u0131\u011F\u0131 bulunamad\u0131.");
+    const job = await this.jobs.findOne({ _id: value.jobId });
+    if (job && (job.status === "done" || job.status === "failed")) {
+      await this.reconcile(job);
+      value = await this.machines.findOne({ _id: machineId, ownerId: userId });
+      if (!value) throw new HttpError(404, "VM'nin domain haz\u0131rl\u0131\u011F\u0131 temizlendi.");
+    }
+    if (["preparing", "joining", "verifying", "cleaning"].includes(value.phase) && (!job || job.expiresAt.getTime() <= Date.now()) && (value.changedAt?.getTime() ?? 0) < Date.now() - 3e4) {
+      await this.machines.updateOne({ _id: machineId, generation: value.generation, jobId: value.jobId }, { $set: { phase: "failed", error: "AD haz\u0131rl\u0131\u011F\u0131n\u0131n s\xFCresi doldu. Temizleyip yeniden haz\u0131rlay\u0131n." } });
+      value.phase = "failed";
+    }
+    return value;
+  }
+  async account(userId) {
+    let value = await this.accounts.findOne({ _id: userId });
+    if (value?.state === "pending") {
+      const job = await this.jobs.findOne({ _id: value.jobId });
+      if (job && ["done", "failed"].includes(job.status)) {
+        await this.reconcile(job);
+        value = await this.accounts.findOne({ _id: userId });
+      } else if ((!job || job.expiresAt.getTime() <= Date.now()) && (value.changedAt?.getTime() ?? 0) < Date.now() - 3e4) {
+        await this.accounts.updateOne({ _id: userId, jobId: value.jobId }, { $set: { state: "failed" } });
+        value.state = "failed";
+      }
+    }
+    return value ? { username: value.username, domain: value.domain, state: value.state } : null;
+  }
+  async setAccount(user, body) {
+    const username = typeof body.username === "string" ? body.username.trim().toLowerCase() : "", password = body.password;
+    if (!windowsUsername.test(username) || /^(administrator|admin|guest|krbtgt|dc1|defaultaccount)$/.test(username) || typeof password !== "string" || password.length < 14 || password.length > 128 || /[\x00\r\n]/.test(password))
+      throw new HttpError(400, "Windows kullan\u0131c\u0131 ad\u0131 3\u201320 k\xFC\xE7\xFCk harf/rakam, alt \xE7izgi veya tire; parola en az 14 karakter olmal\u0131.");
+    await this.account(user.id);
+    const existing = await this.accounts.findOne({ _id: user.id });
+    if (existing?.state === "pending") throw new HttpError(409, "Windows hesab\u0131 i\u015Flemi devam ediyor.");
+    if (existing && existing.username !== username) throw new HttpError(409, "Mevcut Windows hesab\u0131n\u0131n kullan\u0131c\u0131 ad\u0131 de\u011Fi\u015Ftirilemez.");
+    const jobId = (0, import_node_crypto3.randomUUID)();
+    try {
+      if (existing) {
+        const saved = await this.accounts.updateOne({ _id: user.id, jobId: existing.jobId, state: { $ne: "pending" } }, { $set: { state: "pending", jobId, changedAt: /* @__PURE__ */ new Date() } });
+        if (!saved.modifiedCount) throw new HttpError(409, "Windows hesab\u0131 i\u015Flemi devam ediyor.");
+      } else await this.accounts.insertOne({ _id: user.id, username, domain: this.options.netbios, state: "pending", jobId, changedAt: /* @__PURE__ */ new Date() });
+    } catch (error) {
+      await this.jobs.deleteOne({ _id: jobId, status: "queued" });
+      if (error instanceof import_mongodb2.MongoServerError && error.code === 11e3) throw new HttpError(409, "Bu Windows kullan\u0131c\u0131 ad\u0131 kullan\u0131l\u0131yor veya ba\u015Fka bir hesap i\u015Flemi devam ediyor.");
+      throw error;
+    }
+    try {
+      await this.enqueue("account", user.id, { userId: user.id, username, password, objectGuid: existing?.objectGuid }, void 0, jobId);
+    } catch (error) {
+      await this.accounts.updateOne({ _id: user.id, jobId }, { $set: { state: "failed" } });
+      throw error;
+    }
+    return this.account(user.id);
+  }
+  async prepare(user, body) {
+    const { machineId, deviceId } = body;
+    if (typeof machineId !== "string" || !directoryUuid.test(machineId) || typeof deviceId !== "string" || !directoryUuid.test(deviceId)) throw new HttpError(400, "Makine veya cihaz kimli\u011Fi ge\xE7ersiz.");
+    const old = await this.machines.findOne({ _id: machineId });
+    if (old) {
+      if (old.ownerId !== user.id || old.deviceId !== deviceId) throw new HttpError(403, "Makinenin sahipli\u011Fi uyu\u015Fmuyor.");
+      const current = await this.owned(user.id, machineId);
+      if (current.phase === "cleaning" || current.phase === "failed") throw new HttpError(409, "\xD6nce \xF6nceki AD/VPN haz\u0131rl\u0131\u011F\u0131n\u0131 temizleyin.");
+      return this.publicMachine(current);
+    }
+    const generation = (0, import_node_crypto3.randomUUID)(), jobId = (0, import_node_crypto3.randomUUID)();
+    const doc = { _id: machineId, machineId, deviceId, ownerId: user.id, generation, computerName: "ND-" + generation.replaceAll("-", "").slice(0, 12).toUpperCase(), phase: "preparing", jobId, changedAt: /* @__PURE__ */ new Date() };
+    await this.machines.insertOne(doc);
+    await this.enqueue("provision", user.id, { ...this.publicMachine(doc), ownerId: user.id }, doc, jobId);
+    return this.publicMachine(doc);
+  }
+  async bootstrap(user, id) {
+    const machine = await this.owned(user.id, id), job = await this.jobs.findOne({ _id: machine.jobId, status: "done", expiresAt: { $gt: /* @__PURE__ */ new Date() } });
+    if (machine.phase !== "joining" || !job?.result || job.kind !== "provision") throw new HttpError(409, "VM kat\u0131l\u0131m bilgisi hen\xFCz haz\u0131r de\u011Fil veya s\xFCresi doldu.");
+    return { ...this.publicMachine(machine), ...this.open(job.result), config: this.config() };
+  }
+  async verify(user, id, body) {
+    const machine = await this.owned(user.id, id);
+    if (body.generation !== machine.generation || body.computerName !== machine.computerName || body.domain !== this.options.domain || body.secureChannel !== true || body.nla !== true) throw new HttpError(409, "VM'nin domain ve ba\u011Flant\u0131 kan\u0131t\u0131 uyu\u015Fmuyor.");
+    if (machine.phase === "ready" || machine.phase === "verifying") return this.publicMachine(machine);
+    if (machine.phase !== "joining") throw new HttpError(409, "VM domain kat\u0131l\u0131m\u0131 i\xE7in haz\u0131r de\u011Fil.");
+    const jobId = (0, import_node_crypto3.randomUUID)();
+    const changed = await this.machines.updateOne({ _id: id, generation: machine.generation, phase: "joining" }, { $set: { phase: "verifying", jobId, changedAt: /* @__PURE__ */ new Date() } });
+    if (changed.modifiedCount) await this.enqueue("verify", user.id, { ...this.publicMachine(machine), ownerId: user.id, computerGuid: machine.computerGuid }, machine, jobId);
+    return this.publicMachine(await this.owned(user.id, id));
+  }
+  async cleanup(userId, id) {
+    if (await this.db.collection("rental_listings").findOne({ ownerId: userId, machineId: id, resetRequired: false, "lease.phase": { $in: ["reserved", "active"] } }, { projection: { _id: 1 } })) throw new HttpError(409, "Aktif kiralama bitmeden makinenin AD/VPN kimli\u011Fi temizlenemez.");
+    const machine = await this.owned(userId, id);
+    if (machine.phase === "cleaning") return this.publicMachine(machine);
+    const jobId = (0, import_node_crypto3.randomUUID)();
+    const saved = await this.machines.updateOne({ _id: id, generation: machine.generation, jobId: machine.jobId }, { $set: { phase: "cleaning", jobId, changedAt: /* @__PURE__ */ new Date() } });
+    if (saved.modifiedCount) await this.enqueue("cleanup", userId, { ...this.publicMachine(machine), ownerId: userId, computerGuid: machine.computerGuid, deviceNodeId: machine.deviceNodeId }, machine, jobId);
+    return this.publicMachine(await this.owned(userId, id));
+  }
+  async assertReady(ownerId, machineId, generation) {
+    const machine = await this.owned(ownerId, machineId);
+    if (machine.phase !== "ready" || machine.generation !== generation) throw new HttpError(409, "VM'nin AD/VPN do\u011Frulamas\u0131 tamamlanmad\u0131.");
+    return machine;
+  }
+  async grant(machine, guestId, leaseId) {
+    const account = await this.accounts.findOne({ _id: guestId, state: "ready" });
+    if (!account?.sid) throw new HttpError(409, "\xD6nce Windows hesab\u0131m ekran\u0131ndan ki\u015Fisel hesab\u0131n\u0131 haz\u0131rla.");
+    const jobId = await this.enqueue("grant", machine.ownerId, { machineId: machine.machineId, generation: machine.generation, computerName: machine.computerName, ownerId: machine.ownerId, group: machine.group, username: account.username, sid: account.sid, leaseId }, machine);
+    return { jobId, username: `${this.options.netbios}\\${account.username}` };
+  }
+  async jobDone(id) {
+    const job = await this.jobs.findOne({ _id: id, expiresAt: { $gt: /* @__PURE__ */ new Date() } });
+    if (!job || job.status === "failed") throw new HttpError(409, job?.error ?? "AD i\u015Flemi tamamlanamad\u0131.");
+    return job.status === "done";
+  }
+  authenticate(token) {
+    return (0, import_node_crypto3.timingSafeEqual)((0, import_node_crypto3.createHash)("sha256").update(token).digest(), (0, import_node_crypto3.createHash)("sha256").update(this.options.agentToken).digest());
+  }
+  async claim() {
+    await this.db.collection("directory_agent").updateOne({ name: "dc1" }, { $set: { seenAt: /* @__PURE__ */ new Date() } }, { upsert: true });
+    const claim = (0, import_node_crypto3.randomBytes)(32).toString("hex"), now = /* @__PURE__ */ new Date();
+    const job = await this.jobs.findOneAndUpdate({ expiresAt: { $gt: now }, $or: [{ status: "queued" }, { status: "running", claimUntil: { $lt: now } }] }, { $set: { status: "running", claim, claimUntil: new Date(Date.now() + 18e4) } }, { sort: { createdAt: 1 }, returnDocument: "after" });
+    if (!job) return null;
+    const current = job.kind === "account" ? await this.accounts.findOne({ _id: job.ownerId, jobId: job._id }) : job.machineId ? await this.machines.findOne({ _id: job.machineId, generation: job.generation, ...job.kind === "grant" ? { phase: "ready" } : { jobId: job._id } }) : null;
+    if (!current) {
+      await this.jobs.updateOne({ _id: job._id, claim }, { $set: { status: "failed", error: "AD i\u015Flemi daha yeni bir istekle de\u011Fi\u015Ftirildi." }, $unset: { encrypted: "", claim: "" } });
+      return null;
+    }
+    return { id: job._id, kind: job.kind, claim, payload: this.open(job.encrypted), config: this.config() };
+  }
+  async complete(id, body) {
+    if (!directoryUuid.test(id) || typeof body.claim !== "string" || typeof body.success !== "boolean" || !body.result || typeof body.result !== "object" || Array.isArray(body.result)) throw new HttpError(400, "AD i\u015F sonucu ge\xE7ersiz.");
+    const job = await this.jobs.findOne({ _id: id, status: "running", claim: body.claim, claimUntil: { $gt: /* @__PURE__ */ new Date() }, expiresAt: { $gt: /* @__PURE__ */ new Date() } });
+    if (!job) throw new HttpError(409, "AD i\u015Finin s\xFCresi veya sahipli\u011Fi de\u011Fi\u015Fti.");
+    const result = body.result;
+    if (body.success) {
+      if (job.kind === "provision" && (typeof result.odj !== "string" || result.odj.length > 18e4 || typeof result.authKey !== "string" || !directoryUuid.test(String(result.computerGuid)) || !/^GG_ND_[A-F0-9]{12}$/.test(String(result.group)))) throw new HttpError(400, "Domain haz\u0131rl\u0131k sonucu ge\xE7ersiz.");
+      if (job.kind === "account" && (!/^S-1-5-21-[\d-]+$/.test(String(result.sid)) || !directoryUuid.test(String(result.objectGuid)))) throw new HttpError(400, "Windows hesab\u0131 sonucu ge\xE7ersiz.");
+      if (job.kind === "verify" && (!/^100\./.test(String(result.ip)) || typeof result.deviceNodeId !== "string" || !result.deviceNodeId)) throw new HttpError(400, "VPN do\u011Frulama sonucu ge\xE7ersiz.");
+    }
+    const codes = {
+      DIRECTORY_ACCOUNT: "Windows hesab\u0131 olu\u015Fturulamad\u0131. Kullan\u0131c\u0131 ad\u0131, AD parola politikas\u0131 ve Users OU yetkisini kontrol edin.",
+      DIRECTORY_DOMAIN_JOIN: "Domain kat\u0131l\u0131m verisi olu\u015Fturulamad\u0131. DC1 \xFCzerindeki servis hesab\u0131n\u0131n Computers OU yetkisini kontrol edin.",
+      DIRECTORY_VPN_KEY: "Tailscale kay\u0131t anahtar\u0131 olu\u015Fturulamad\u0131. DC1 \xFCzerindeki OAuth istemcisinin auth_keys yetkisini ve VM etiketini kontrol edin.",
+      DIRECTORY_DNS: "VM'nin dinamik DNS kayd\u0131 VPN IP'siyle uyu\u015Fmuyor. VM DNS kayd\u0131n\u0131 ve DC1 DNS hizmetini kontrol edin.",
+      DIRECTORY_GRANT: "Ki\u015Fisel Windows hesab\u0131n\u0131n VM oturum izni verilemedi. Parola s\xFCresini ve VM grubunu kontrol edin.",
+      DIRECTORY_CLEANUP: "\xD6nceki AD/VPN kimli\u011Fi temizlenemedi. DC1 arac\u0131s\u0131, Tailscale devices:core izni ve OU yetkilerini kontrol edin."
+    };
+    const error = codes[String(result.code)] ?? "AD arac\u0131s\u0131 i\u015Flemi tamamlayamad\u0131. DC1 \xFCzerindeki Nodera AD hizmetini ve ilgili OU yetkilerini kontrol edin.";
+    const saved = await this.jobs.updateOne({ _id: id, status: "running", claim: body.claim }, { $set: { status: body.success ? "done" : "failed", ...body.success ? { result: this.seal(result) } : { error } }, $unset: { encrypted: "", claim: "" } });
+    if (!saved.modifiedCount) throw new HttpError(409, "AD sonucu zaten i\u015Flendi.");
+    await this.reconcile(await this.jobs.findOne({ _id: id }));
+    return { ok: true };
+  }
+  async reconcile(job) {
+    if (job.status !== "done" && job.status !== "failed") return;
+    const id = job._id, success = job.status === "done", result = job.result ? this.open(job.result) : {}, error = job.error;
+    if (job.kind === "account") await this.accounts.updateOne({ _id: job.ownerId, jobId: id, state: "pending" }, { $set: success ? { state: "ready", sid: String(result.sid), objectGuid: String(result.objectGuid) } : { state: "failed" } });
+    if (job.machineId && ["provision", "verify", "cleanup"].includes(job.kind)) {
+      if (success && job.kind === "cleanup") {
+        await this.machines.deleteOne({ _id: job.machineId, generation: job.generation, jobId: id, phase: "cleaning" });
+        await this.jobs.updateMany({ machineId: job.machineId, generation: job.generation, _id: { $ne: id }, status: { $in: ["done", "failed"] } }, { $unset: { encrypted: "", result: "" } });
+      } else {
+        await this.machines.updateOne({ _id: job.machineId, generation: job.generation, jobId: id }, { $set: success ? job.kind === "provision" ? { phase: "joining", computerGuid: String(result.computerGuid), group: String(result.group) } : { phase: "ready", deviceNodeId: String(result.deviceNodeId) } : { phase: "failed", error } });
+        if (success && job.kind === "verify") await this.jobs.updateMany({ machineId: job.machineId, generation: job.generation, kind: "provision" }, { $unset: { result: "", encrypted: "" } });
+      }
+    }
   }
 };
 
@@ -363,6 +605,7 @@ var AccountStore = class {
   }
   async initialize() {
     await initializeMarketplace(this.db);
+    await initializeDirectory(this.db);
     await this.accounts.createIndex(
       { email: 1 },
       { unique: true, name: "unique_email" }
@@ -396,7 +639,7 @@ var AccountStore = class {
         returnDocument: "after"
       });
     } catch (error) {
-      if (!(error instanceof import_mongodb2.MongoServerError) || error.code !== 11e3)
+      if (!(error instanceof import_mongodb3.MongoServerError) || error.code !== 11e3)
         throw error;
       result = await this.attempts.findOneAndUpdate({ _id: id }, update, {
         returnDocument: "after"
@@ -409,7 +652,7 @@ var AccountStore = class {
       );
   }
   async register(name, email, password, remember = false) {
-    const id = (0, import_node_crypto3.randomUUID)();
+    const id = (0, import_node_crypto4.randomUUID)();
     const account = {
       _id: id,
       id,
@@ -421,7 +664,7 @@ var AccountStore = class {
     try {
       await this.accounts.insertOne(account);
     } catch (error) {
-      if (error instanceof import_mongodb2.MongoServerError && error.code === 11e3)
+      if (error instanceof import_mongodb3.MongoServerError && error.code === 11e3)
         throw new HttpError(409, "Bu e-posta ile zaten bir hesap var.");
       throw error;
     }
@@ -438,7 +681,7 @@ var AccountStore = class {
     return this.issueSession(account, remember);
   }
   async issueSession(account, remember) {
-    const token = (0, import_node_crypto3.randomBytes)(32).toString("hex");
+    const token = (0, import_node_crypto4.randomBytes)(32).toString("hex");
     const expiresAt = new Date(Date.now() + (remember ? 30 : 1) * 864e5);
     await this.sessions.insertOne({
       _id: tokenHash(token),
@@ -473,7 +716,7 @@ async function connectAccounts(uri, databaseName) {
     throw new IdentityStartupError("CONFIG_URI");
   if (!/^[a-zA-Z0-9_-]{1,63}$/.test(databaseName))
     throw new IdentityStartupError("CONFIG_DATABASE");
-  const client = new import_mongodb2.MongoClient(uri, {
+  const client = new import_mongodb3.MongoClient(uri, {
     appName: "Nodera Identity",
     maxPoolSize: 10,
     serverSelectionTimeoutMS: 5e3,
@@ -494,12 +737,12 @@ async function connectAccounts(uri, databaseName) {
 
 // apps/api/src/app.ts
 var import_node_http = __toESM(require("node:http"), 1);
-var import_node_crypto5 = require("node:crypto");
+var import_node_crypto6 = require("node:crypto");
 var import_node_net = require("node:net");
 
 // apps/api/src/relay.ts
 var import_ws = require("ws");
-var import_node_crypto4 = require("node:crypto");
+var import_node_crypto5 = require("node:crypto");
 
 // packages/shared/src/marketplace-filters.ts
 var marketResources = ["cpu", "memory", "storage"];
@@ -556,7 +799,7 @@ function readMarketFilters(params = new URLSearchParams()) {
 }
 
 // apps/api/src/relay.ts
-function createRentalRelay(server, accounts, rateSecret) {
+function createRentalRelay(server, accounts, rateSecret, directory) {
   const market = new MarketplaceStore(accounts.database);
   const hosts = /* @__PURE__ */ new Map();
   const pairs = /* @__PURE__ */ new Map();
@@ -570,6 +813,7 @@ function createRentalRelay(server, accounts, rateSecret) {
   const key = (owner, device) => `${owner}:${device}`;
   const peerFor = (listing) => hosts.get(key(listing.ownerId, listing.deviceId));
   const online = (listing) => {
+    if (directory && !listing.directoryGeneration) return false;
     const peer = peerFor(listing);
     return !!peer && peer.ws.readyState === import_ws.WebSocket.OPEN && peer.seen > Date.now() - 3e4 && peer.ready.has(listing.machineId);
   };
@@ -590,6 +834,8 @@ function createRentalRelay(server, accounts, rateSecret) {
     if (!listing.lease) return;
     closePair(listing.lease.id);
     await market.end(listing);
+    if (directory && listing.directoryGeneration) await directory.cleanup(listing.ownerId, listing.machineId).catch(() => {
+    });
     send(peerFor(listing), {
       type: "reset",
       listingId: listing._id,
@@ -636,6 +882,10 @@ function createRentalRelay(server, accounts, rateSecret) {
           throw new Error();
         if (data[2] === "host" ? listing.ownerId !== user.id || listing.deviceId !== deviceId : listing.lease.guestId !== user.id)
           throw new Error();
+        if (listing.directoryGeneration) {
+          if (!directory || !listing.lease.startedAt) throw new Error();
+          await directory.assertReady(listing.ownerId, listing.machineId, listing.directoryGeneration);
+        }
         const pair = pairs.get(data[1]);
         if (pair?.[data[2]]) throw new Error();
       }
@@ -684,8 +934,10 @@ function createRentalRelay(server, accounts, rateSecret) {
             void market.listings.find({ ownerId: user.id, deviceId }).toArray().then(async (listings) => {
               for (const item2 of listings) {
                 credentials2.delete(item2._id);
-                if (item2.lease && item2.lease.phase !== "resetting")
-                  await end(item2);
+                if (item2.lease && item2.lease.phase !== "resetting") {
+                  if (item2.directoryGeneration) closePair(item2.lease.id);
+                  else await end(item2);
+                }
               }
             }).catch(() => {
             });
@@ -699,22 +951,26 @@ function createRentalRelay(server, accounts, rateSecret) {
         if (!pair) {
           pair = {
             timer: setTimeout(() => {
-              void end(item).catch(() => closePair(leaseId));
+              if (item.directoryGeneration) closePair(leaseId);
+              else void end(item).catch(() => closePair(leaseId));
             }, 2e4)
           };
           pairs.set(leaseId, pair);
         }
         pair[data[2]] = ws;
         ws.on("close", () => {
-          if (pairs.has(leaseId))
-            void end(item).catch(() => closePair(leaseId));
+          if (pairs.has(leaseId)) {
+            if (item.directoryGeneration) closePair(leaseId);
+            else void end(item).catch(() => closePair(leaseId));
+          }
         });
         if (data[2] === "guest" && !pair.host)
           send(peerFor(item), {
             type: "connect",
             machineId: item.machineId,
             listingId: item._id,
-            leaseId
+            leaseId,
+            ...item.directoryGeneration ? { expiresAt: item.lease.expiresAt.toISOString(), directoryGeneration: item.directoryGeneration } : {}
           });
         if (pair.host && pair.guest && !pair.pairing) {
           pair.pairing = true;
@@ -729,7 +985,7 @@ function createRentalRelay(server, accounts, rateSecret) {
             {
               $set: {
                 "lease.phase": "active",
-                "lease.expiresAt": new Date(Date.now() + 60 * 6e4)
+                ...item.directoryGeneration ? {} : { "lease.expiresAt": new Date(Date.now() + 60 * 6e4) }
               }
             }
           ).then((result) => {
@@ -747,14 +1003,16 @@ function createRentalRelay(server, accounts, rateSecret) {
             connectedPair.streams = [left, right];
             for (const stream of connectedPair.streams)
               stream.on("error", () => {
-                void end(item).catch(() => closePair(leaseId));
+                if (item.directoryGeneration) closePair(leaseId);
+                else void end(item).catch(() => closePair(leaseId));
               });
             left.pipe(right);
             right.pipe(left);
             connectedPair.host.resume();
             connectedPair.guest.resume();
           }).catch(() => {
-            void end(item).catch(() => closePair(leaseId));
+            if (item.directoryGeneration) closePair(leaseId);
+            else void end(item).catch(() => closePair(leaseId));
           });
         }
       });
@@ -861,16 +1119,14 @@ function createRentalRelay(server, accounts, rateSecret) {
             409,
             "Makinenin \xE7evrimi\xE7i ve RDP ba\u011Flant\u0131s\u0131n\u0131n haz\u0131r olmas\u0131 gerekiyor."
           );
-        if (typeof body.username !== "string" || !/^[a-zA-Z0-9_.\\@-]{1,64}$/.test(body.username) || typeof body.password !== "string" || body.password.length < 12 || body.password.length > 128)
+        if (directory) await directory.assertReady(user.id, String(body.machineId), body.directoryGeneration);
+        if (!directory && (typeof body.username !== "string" || !/^[a-zA-Z0-9_.\\@-]{1,64}$/.test(body.username) || typeof body.password !== "string" || body.password.length < 12 || body.password.length > 128))
           throw new HttpError(
             400,
             "VM i\xE7in ayr\u0131 Windows kullan\u0131c\u0131 ad\u0131 ve en az 12 karakterli parolay\u0131 girin."
           );
         const item = await market.publish(user, deviceId, body);
-        credentials2.set(item._id, {
-          username: body.username,
-          password: body.password
-        });
+        if (!directory) credentials2.set(item._id, { username: String(body.username), password: String(body.password) });
         return { offer: publicItem(item) };
       }
       const action = pathname.match(
@@ -878,7 +1134,7 @@ function createRentalRelay(server, accounts, rateSecret) {
       );
       if (method === "POST" && action) {
         await accounts.rateLimit(
-          (0, import_node_crypto4.createHmac)("sha256", rateSecret).update(`rental:${user.id}`).digest("hex"),
+          (0, import_node_crypto5.createHmac)("sha256", rateSecret).update(`rental:${user.id}`).digest("hex"),
           60
         );
         const item = await market.listings.findOne({ _id: action[1] });
@@ -889,8 +1145,24 @@ function createRentalRelay(server, accounts, rateSecret) {
               400,
               "Oturum sonunda dosyalar\u0131n silinece\u011Fini onaylay\u0131n."
             );
-          if (!online(item) || !credentials2.has(item._id))
+          if (!online(item) || !item.directoryGeneration && !credentials2.has(item._id))
             throw new HttpError(409, "Makine \xE7evrimd\u0131\u015F\u0131.");
+          if (item.directoryGeneration) {
+            if (!directory) throw new HttpError(503, "AD hizmeti kapal\u0131.");
+            const machine = await directory.assertReady(item.ownerId, item.machineId, item.directoryGeneration);
+            if ((await directory.account(user.id))?.state !== "ready") throw new HttpError(409, "\xD6nce Windows hesab\u0131m ekran\u0131ndan hesab\u0131n\u0131 olu\u015Ftur.");
+            const durationMinutes = Number(body.durationMinutes ?? 240);
+            if (![60, 120, 240, 480, 720, 1440].includes(durationMinutes)) throw new HttpError(400, "Kiralama s\xFCresi ge\xE7ersiz.");
+            const reserved = await market.reserve(user, item._id, durationMinutes);
+            try {
+              const grant = await directory.grant(machine, user.id, reserved.lease.id);
+              await market.listings.updateOne({ _id: item._id, "lease.id": reserved.lease.id, "lease.phase": "reserved" }, { $set: { "lease.grantJobId": grant.jobId } });
+              return { offer: publicItem(await market.forLease(reserved.lease.id)) };
+            } catch (error) {
+              await end(reserved);
+              throw error;
+            }
+          }
           return { offer: publicItem(await market.reserve(user, item._id)) };
         }
         if (item.ownerId !== user.id || item.deviceId !== body.deviceId)
@@ -898,13 +1170,17 @@ function createRentalRelay(server, accounts, rateSecret) {
         if (action[2] === "reset") {
           if (typeof body.leaseId !== "string" || !uuid.test(body.leaseId))
             throw new HttpError(400, "Temizlenecek oturum kimli\u011Fi ge\xE7ersiz.");
-          await market.reset(user.id, item.deviceId, item._id, body.leaseId);
+          if (directory && item.directoryGeneration) {
+            const machine = await directory.assertReady(user.id, item.machineId, body.directoryGeneration);
+            if (!peerFor(item)?.ready.has(item.machineId)) throw new HttpError(409, "Yeni \xE7al\u0131\u015Fma ortam\u0131n\u0131n RDP kontrol\xFC tamamlanmal\u0131.");
+            await market.reset(user.id, item.deviceId, item._id, body.leaseId, machine.generation, item.autoPublish === true);
+          } else await market.reset(user.id, item.deviceId, item._id, body.leaseId);
           credentials2.delete(item._id);
           return { ok: true };
         }
         const unpublished = await market.listings.findOneAndUpdate(
           { _id: item._id, ownerId: user.id, deviceId: item.deviceId },
-          { $set: { published: false } },
+          { $set: { published: false, autoPublish: false } },
           { returnDocument: "after" }
         );
         if (!unpublished) throw new HttpError(404, "Makine bulunamad\u0131.");
@@ -925,6 +1201,15 @@ function createRentalRelay(server, accounts, rateSecret) {
         }
         if (method === "GET" && rental[2] === "credentials" && item.lease.guestId === user.id && !item.resetRequired && item.lease.expiresAt.getTime() > Date.now() && online(item)) {
           const value = credentials2.get(item._id);
+          if (directory && item.directoryGeneration) {
+            if (!item.lease.startedAt && (!item.lease.grantJobId || !await directory.jobDone(item.lease.grantJobId))) throw new HttpError(409, "Ki\u015Fisel Windows oturumunun yetkileri haz\u0131rlan\u0131yor.");
+            const account = await directory.account(user.id);
+            if (!account || account.state !== "ready") throw new HttpError(409, "Windows hesab\u0131 haz\u0131r de\u011Fil.");
+            if (!item.lease.startedAt) await market.listings.updateOne({ _id: item._id, "lease.id": item.lease.id, "lease.phase": "reserved", "lease.startedAt": { $exists: false } }, { $set: { "lease.startedAt": /* @__PURE__ */ new Date(), "lease.expiresAt": new Date(Date.now() + (item.lease.durationMinutes ?? 240) * 6e4) } });
+            const current = await market.forLease(item.lease.id);
+            const machine = await directory.assertReady(item.ownerId, item.machineId, item.directoryGeneration);
+            return { username: `${account.domain}\\${account.username}`, serverName: `${machine.computerName}.${directory.options.domain}`, domainAccount: true, expiresAt: current.lease.expiresAt.toISOString(), directoryGeneration: item.directoryGeneration };
+          }
           if (!value)
             throw new HttpError(409, "Ba\u011Flant\u0131 yeniden haz\u0131rlanmal\u0131.");
           return value;
@@ -940,6 +1225,7 @@ function createRentalRelay(server, accounts, rateSecret) {
 function createIdentityServer(store, options) {
   if (options.rateSecret.length < 32)
     throw new Error("AUTH_RATE_SECRET en az 32 karakter olmal\u0131.");
+  const directory = options.directory ? new DirectoryService(store.database, options.directory) : void 0;
   const server = import_node_http.default.createServer(async (req, res) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "no-referrer");
@@ -958,13 +1244,25 @@ function createIdentityServer(store, options) {
         json(200, {
           status: "ok",
           service: "nodera-identity",
-          version: "0.4.1",
-          capabilities: ["marketplace", "rdp-relay"]
+          version: "0.5.0",
+          capabilities: ["marketplace", "rdp-relay", ...directory ? ["directory-v1"] : []]
         });
         return;
       }
       if (req.headers.origin)
         throw new HttpError(403, "Bu kayna\u011Fa izin verilmiyor.");
+      if (route.startsWith("POST /v1/ad-agent/")) {
+        const token2 = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1] ?? "";
+        if (!directory || !directory.authenticate(token2)) throw new HttpError(403, "Arac\u0131 yetkisi do\u011Frulanamad\u0131.");
+        if (route === "POST /v1/ad-agent/claim") {
+          json(200, { job: await directory.claim() });
+          return;
+        }
+        const jobId = route.match(/^POST \/v1\/ad-agent\/jobs\/([a-f0-9-]{36})$/)?.[1];
+        if (!jobId) throw new HttpError(404, "Arac\u0131 i\u015Flemi bulunamad\u0131.");
+        json(200, await directory.complete(jobId, await readBody(req, 262144)));
+        return;
+      }
       if (route === "POST /v1/auth/register" || route === "POST /v1/auth/login") {
         let address = req.socket.remoteAddress ?? "unknown";
         if (options.trustProxy) {
@@ -974,7 +1272,7 @@ function createIdentityServer(store, options) {
             throw new HttpError(400, "Proxy adresi do\u011Frulanamad\u0131.");
           address = lastHop;
         }
-        const key = (scope) => (0, import_node_crypto5.createHmac)("sha256", options.rateSecret).update(scope).digest("hex");
+        const key = (scope) => (0, import_node_crypto6.createHmac)("sha256", options.rateSecret).update(scope).digest("hex");
         await store.rateLimit(key(`ip:${address}`), 60);
         const body = await readBody(req);
         if (body.remember !== void 0 && typeof body.remember !== "boolean")
@@ -1001,11 +1299,54 @@ function createIdentityServer(store, options) {
       const marketplaceRoute = /^\/(?:v1\/marketplace|v1\/rentals)(?:\/|$)/.test(
         new URL(req.url ?? "/", "http://identity.local").pathname
       );
-      if (route !== "GET /v1/auth/me" && route !== "POST /v1/auth/logout" && !marketplaceRoute)
+      const directoryRoute = /^\/(?:v1\/directory)(?:\/|$)/.test(new URL(req.url ?? "/", "http://identity.local").pathname);
+      if (route !== "GET /v1/auth/me" && route !== "POST /v1/auth/logout" && !marketplaceRoute && !directoryRoute)
         throw new HttpError(404, "\u0130\u015Flem bulunamad\u0131.");
       const match = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/);
       if (!match) throw new HttpError(401, "Devam etmek i\xE7in giri\u015F yap\u0131n.");
       const token = match[1];
+      if (directoryRoute) {
+        const user = await store.userFor(token), pathname = new URL(req.url ?? "/", "http://identity.local").pathname;
+        if (route === "GET /v1/directory/config") {
+          json(200, directory ? { ...directory.config(), agentOnline: await directory.agentOnline() } : { enabled: false });
+          return;
+        }
+        if (!directory) throw new HttpError(503, "Sunucuda otomatik AD haz\u0131rl\u0131\u011F\u0131 hen\xFCz yap\u0131land\u0131r\u0131lmad\u0131.");
+        if (route === "GET /v1/directory/account") {
+          json(200, { account: await directory.account(user.id) });
+          return;
+        }
+        if (route === "POST /v1/directory/account") {
+          await store.rateLimit("directory-account:" + user.id, 12);
+          json(200, { account: await directory.setAccount(user, await readBody(req)) });
+          return;
+        }
+        if (route === "POST /v1/directory/machines") {
+          await store.rateLimit("directory-machine:" + user.id, 30);
+          json(200, { machine: await directory.prepare(user, await readBody(req)) });
+          return;
+        }
+        const machineRoute = pathname.match(/^\/v1\/directory\/machines\/([a-f0-9-]{36})(?:\/(bootstrap|verify|cleanup))?$/);
+        if (!machineRoute) throw new HttpError(404, "Domain i\u015Flemi bulunamad\u0131.");
+        const [, id, action] = machineRoute;
+        if (req.method === "GET" && !action) {
+          json(200, { machine: directory.publicMachine(await directory.owned(user.id, id)) });
+          return;
+        }
+        if (req.method === "GET" && action === "bootstrap") {
+          json(200, await directory.bootstrap(user, id));
+          return;
+        }
+        if (req.method === "POST" && action === "verify") {
+          json(200, { machine: await directory.verify(user, id, await readBody(req)) });
+          return;
+        }
+        if (req.method === "POST" && action === "cleanup") {
+          json(200, { machine: await directory.cleanup(user.id, id) });
+          return;
+        }
+        throw new HttpError(404, "Domain i\u015Flemi bulunamad\u0131.");
+      }
       if (marketplaceRoute) {
         const user = await store.userFor(token);
         json(
@@ -1036,20 +1377,20 @@ function createIdentityServer(store, options) {
       }
     }
   });
-  const relay = createRentalRelay(server, store, options.rateSecret);
+  const relay = createRentalRelay(server, store, options.rateSecret, directory);
   server.requestTimeout = 15e3;
   server.headersTimeout = 1e4;
   server.maxHeadersCount = 40;
   return Object.assign(server, { stopRentalRelay: relay.stop });
 }
-async function readBody(req) {
+async function readBody(req, limit = 16384) {
   if (!req.headers["content-type"]?.startsWith("application/json"))
     throw new HttpError(415, "JSON i\xE7erik gerekli.");
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 16384) throw new HttpError(413, "\u0130stek \xE7ok b\xFCy\xFCk.");
+    if (size > limit) throw new HttpError(413, "\u0130stek \xE7ok b\xFCy\xFCk.");
     chunks.push(chunk);
   }
   try {
@@ -1075,7 +1416,8 @@ async function main() {
   );
   const server = createIdentityServer(store, {
     rateSecret,
-    trustProxy: process.env.TRUST_PROXY === "1"
+    trustProxy: process.env.TRUST_PROXY === "1",
+    directory: directoryOptions()
   });
   server.listen(
     port,
