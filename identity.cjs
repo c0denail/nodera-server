@@ -346,6 +346,21 @@ var import_node_crypto3 = require("node:crypto");
 var import_mongodb2 = require("mongodb");
 
 // packages/shared/src/directory.ts
+function readWindowsAccountProfile(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Windows hesab\u0131 i\xE7in ad, soyad ve e-posta bilgilerini doldur.");
+  const fields = value;
+  const name = (key, label) => {
+    const raw = fields[key];
+    if (typeof raw !== "string" || /[\x00-\x1f\x7f]/.test(raw)) throw new Error(`${label} 1\u201364 karakter olmal\u0131.`);
+    const result = raw.normalize("NFC").trim().replace(/ +/g, " ");
+    if (!result || result.length > 64) throw new Error(`${label} 1\u201364 karakter olmal\u0131.`);
+    return result;
+  };
+  const givenName = name("givenName", "Ad"), surname = name("surname", "Soyad");
+  const email = typeof fields.email === "string" ? fields.email.trim() : "";
+  if (email.length > 254 || /[\x00-\x1f\x7f]/.test(email) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("Ge\xE7erli bir Windows hesab\u0131 e-posta adresi gir.");
+  return { givenName, surname, email };
+}
 var directoryUuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 var windowsUsername = /^[a-z][a-z0-9_-]{2,19}$/;
 
@@ -439,29 +454,39 @@ var DirectoryService = class {
         value.state = "failed";
       }
     }
-    return value ? { username: value.username, domain: value.domain, state: value.state } : null;
+    return value ? { username: value.username, domain: value.domain, state: value.state, ...value.profile ? { profile: value.profile } : {}, ...value.error ? { error: value.error } : {} } : null;
   }
   async setAccount(user, body) {
     const username = typeof body.username === "string" ? body.username.trim().toLowerCase() : "", password = body.password;
-    if (!windowsUsername.test(username) || /^(administrator|admin|guest|krbtgt|dc1|defaultaccount)$/.test(username) || typeof password !== "string" || password.length < 14 || password.length > 128 || /[\x00\r\n]/.test(password))
+    if (!windowsUsername.test(username) || /^(administrator|admin|guest|krbtgt|dc1|defaultaccount)$/.test(username) || password !== void 0 && (typeof password !== "string" || password.length < 14 || password.length > 128 || /[\x00\r\n]/.test(password)))
       throw new HttpError(400, "Windows kullan\u0131c\u0131 ad\u0131 3\u201320 k\xFC\xE7\xFCk harf/rakam, alt \xE7izgi veya tire; parola en az 14 karakter olmal\u0131.");
     await this.account(user.id);
     const existing = await this.accounts.findOne({ _id: user.id });
     if (existing?.state === "pending") throw new HttpError(409, "Windows hesab\u0131 i\u015Flemi devam ediyor.");
     if (existing && existing.username !== username) throw new HttpError(409, "Mevcut Windows hesab\u0131n\u0131n kullan\u0131c\u0131 ad\u0131 de\u011Fi\u015Ftirilemez.");
+    let profile = existing?.profile;
+    if (body.profile !== void 0) {
+      try {
+        profile = readWindowsAccountProfile(body.profile);
+      } catch (error) {
+        throw new HttpError(400, error.message);
+      }
+    }
+    if (!existing && (password === void 0 || !profile)) throw new HttpError(400, "Yeni Windows hesab\u0131 i\xE7in ad, soyad, e-posta ve parola gerekli.");
+    if (existing && password === void 0 && body.profile === void 0) throw new HttpError(400, "G\xFCncellenecek Windows hesab\u0131 bilgilerini gir.");
     const jobId = (0, import_node_crypto3.randomUUID)();
     try {
       if (existing) {
-        const saved = await this.accounts.updateOne({ _id: user.id, jobId: existing.jobId, state: { $ne: "pending" } }, { $set: { state: "pending", jobId, changedAt: /* @__PURE__ */ new Date() } });
+        const saved = await this.accounts.updateOne({ _id: user.id, jobId: existing.jobId, state: { $ne: "pending" } }, { $set: { state: "pending", jobId, changedAt: /* @__PURE__ */ new Date(), ...profile ? { profile } : {} }, $unset: { error: "" } });
         if (!saved.modifiedCount) throw new HttpError(409, "Windows hesab\u0131 i\u015Flemi devam ediyor.");
-      } else await this.accounts.insertOne({ _id: user.id, username, domain: this.options.netbios, state: "pending", jobId, changedAt: /* @__PURE__ */ new Date() });
+      } else await this.accounts.insertOne({ _id: user.id, username, domain: this.options.netbios, state: "pending", jobId, changedAt: /* @__PURE__ */ new Date(), profile });
     } catch (error) {
       await this.jobs.deleteOne({ _id: jobId, status: "queued" });
       if (error instanceof import_mongodb2.MongoServerError && error.code === 11e3) throw new HttpError(409, "Bu Windows kullan\u0131c\u0131 ad\u0131 kullan\u0131l\u0131yor veya ba\u015Fka bir hesap i\u015Flemi devam ediyor.");
       throw error;
     }
     try {
-      await this.enqueue("account", user.id, { userId: user.id, username, password, objectGuid: existing?.objectGuid }, void 0, jobId);
+      await this.enqueue("account", user.id, { userId: user.id, username, ...password !== void 0 ? { password } : {}, ...profile ? { profile } : {}, objectGuid: existing?.objectGuid }, void 0, jobId);
     } catch (error) {
       await this.accounts.updateOne({ _id: user.id, jobId }, { $set: { state: "failed" } });
       throw error;
@@ -548,9 +573,18 @@ var DirectoryService = class {
       if (job.kind === "provision" && (typeof result.odj !== "string" || result.odj.length > 18e4 || typeof result.authKey !== "string" || !directoryUuid.test(String(result.computerGuid)) || !/^GG_ND_[A-F0-9]{12}$/.test(String(result.group)))) throw new HttpError(400, "Domain haz\u0131rl\u0131k sonucu ge\xE7ersiz.");
       if (job.kind === "account" && (!/^S-1-5-21-[\d-]+$/.test(String(result.sid)) || !directoryUuid.test(String(result.objectGuid)))) throw new HttpError(400, "Windows hesab\u0131 sonucu ge\xE7ersiz.");
       if (job.kind === "verify" && (!/^100\./.test(String(result.ip)) || typeof result.deviceNodeId !== "string" || !result.deviceNodeId)) throw new HttpError(400, "VPN do\u011Frulama sonucu ge\xE7ersiz.");
+      if (job.kind === "account") {
+        const requested = this.open(job.encrypted).profile;
+        const confirmed = result.profile;
+        if (requested && (!confirmed || ["givenName", "surname", "email"].some((key) => confirmed[key] !== requested[key]))) {
+          body.success = false;
+          result.code = "DIRECTORY_ACCOUNT_PROFILE";
+        }
+      }
     }
     const codes = {
       DIRECTORY_ACCOUNT: "Windows hesab\u0131 olu\u015Fturulamad\u0131. Kullan\u0131c\u0131 ad\u0131, AD parola politikas\u0131 ve Users OU yetkisini kontrol edin.",
+      DIRECTORY_ACCOUNT_PROFILE: "AD profil alanlar\u0131 do\u011Frulanamad\u0131. DC1 \xFCzerindeki Nodera AD arac\u0131s\u0131n\u0131 profil destekleyen s\xFCr\xFCme g\xFCncelleyip yeniden deneyin.",
       DIRECTORY_DOMAIN_JOIN: "Domain kat\u0131l\u0131m verisi olu\u015Fturulamad\u0131. DC1 \xFCzerindeki servis hesab\u0131n\u0131n Computers OU yetkisini kontrol edin.",
       DIRECTORY_VPN_KEY: "Tailscale kay\u0131t anahtar\u0131 olu\u015Fturulamad\u0131. DC1 \xFCzerindeki OAuth istemcisinin auth_keys yetkisini ve VM etiketini kontrol edin.",
       DIRECTORY_DNS: "VM'nin dinamik DNS kayd\u0131 VPN IP'siyle uyu\u015Fmuyor. VM DNS kayd\u0131n\u0131 ve DC1 DNS hizmetini kontrol edin.",
@@ -566,7 +600,7 @@ var DirectoryService = class {
   async reconcile(job) {
     if (job.status !== "done" && job.status !== "failed") return;
     const id = job._id, success = job.status === "done", result = job.result ? this.open(job.result) : {}, error = job.error;
-    if (job.kind === "account") await this.accounts.updateOne({ _id: job.ownerId, jobId: id, state: "pending" }, { $set: success ? { state: "ready", sid: String(result.sid), objectGuid: String(result.objectGuid) } : { state: "failed" } });
+    if (job.kind === "account") await this.accounts.updateOne({ _id: job.ownerId, jobId: id, state: "pending" }, { $set: success ? { state: "ready", sid: String(result.sid), objectGuid: String(result.objectGuid) } : { state: "failed", error } });
     if (job.machineId && ["provision", "verify", "cleanup"].includes(job.kind)) {
       if (success && job.kind === "cleanup") {
         await this.machines.deleteOne({ _id: job.machineId, generation: job.generation, jobId: id, phase: "cleaning" });
@@ -1245,7 +1279,7 @@ function createIdentityServer(store, options) {
           status: "ok",
           service: "nodera-identity",
           version: "0.5.0",
-          capabilities: ["marketplace", "rdp-relay", ...directory ? ["directory-v1", "directory-marketplace-v1"] : []]
+          capabilities: ["marketplace", "rdp-relay", ...directory ? ["directory-v1", "directory-marketplace-v1", "windows-account-profile-v1"] : []]
         });
         return;
       }
