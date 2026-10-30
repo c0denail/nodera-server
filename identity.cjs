@@ -64,6 +64,7 @@ function credentials(body) {
 
 // apps/api/src/startup-errors.ts
 var messages = {
+  CONFIG_ADMIN_AD: "NODERA_ADMIN_AUTH_MODE ve NODERA_ADMIN_AD_TRUST ayarlar\u0131 ge\xE7ersiz veya eksik. AD g\xFCven yap\u0131land\u0131rmas\u0131n\u0131 kurulum paketinden kontrol edin.",
   CONFIG_PORT: "PORT, 1 ile 65535 aras\u0131nda bir say\u0131 olmal\u0131.",
   CONFIG_SECRET: "AUTH_RATE_SECRET en az 32 karakter olmal\u0131.",
   CONFIG_URI: "API sunucusunun .env dosyas\u0131ndaki MONGODB_URI ba\u011Flant\u0131 adresini kontrol edin.",
@@ -387,7 +388,8 @@ async function initializeObservability(db) {
     db.collection("admin_events").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
     db.collection("admin_events").createIndex({ createdAt: -1, userId: 1 }),
     db.collection("machine_inventory").createIndex({ ownerId: 1, deviceId: 1, machineId: 1 }, { unique: true }),
-    db.collection("admin_auth_sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+    db.collection("admin_auth_sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+    db.collection("admin_ad_proofs").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
   ]);
 }
 async function recordDiagnostic(db, event) {
@@ -1307,6 +1309,7 @@ function createRentalRelay(server, accounts, rateSecret, directory) {
 
 // apps/api/src/admin.ts
 var import_node_crypto7 = require("node:crypto");
+var import_mongodb4 = require("mongodb");
 function adminEmails(value = "") {
   const emails = value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   if (emails.some((x) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x) || x.length > 254) || emails.length > 20)
@@ -1355,20 +1358,23 @@ function pageOptions(query) {
   return { page, pageSize, search, userId, status: query.get("status") ?? "" };
 }
 var AdminService = class {
-  constructor(store, emails, online, directoryEnabled) {
+  constructor(store, emails, online, directoryEnabled, ad) {
     this.store = store;
     this.emails = emails;
     this.online = online;
     this.directoryEnabled = directoryEnabled;
+    this.ad = ad;
   }
   store;
   emails;
   online;
   directoryEnabled;
+  ad;
   get db() {
     return this.store.database;
   }
   async login(email, password) {
+    if (this.ad) throw new HttpError(403, "Y\xF6netici eri\u015Fimi Windows hesab\u0131yla yap\u0131l\u0131r. G\xFCncel Nodera Y\xF6netim uygulamas\u0131n\u0131 kullan.");
     const user = await this.store.verifyCredentials(email, password);
     if (!this.emails.includes(user.email)) throw new HttpError(403, "Bu hesab\u0131n y\xF6netici eri\u015Fimi yok. Sunucudaki y\xF6netici listesine eklenmesi gerekiyor.");
     const token = (0, import_node_crypto7.randomBytes)(32).toString("hex"), expiresAt = new Date(Date.now() + 8 * 36e5);
@@ -1378,9 +1384,29 @@ var AdminService = class {
   async userFor(token) {
     const session = await this.db.collection("admin_auth_sessions").findOne({ _id: tokenHash(token), expiresAt: { $gt: /* @__PURE__ */ new Date() } });
     if (!session) throw new HttpError(401, "Y\xF6netici oturumu sona erdi. Yeniden giri\u015F yap.");
+    if (this.ad) {
+      if (session.provider !== "ad" || !this.ad.accepts(session.kid, session.issuer, session.groupSid) || !session.principal) throw new HttpError(403, "Y\xF6netici oturumu ge\xE7erli AD yap\u0131land\u0131rmas\u0131na ait de\u011Fil.");
+      const { id, name, email, username, provider } = session.principal;
+      return { id, name, email, username, provider };
+    }
+    if (session.provider === "ad") throw new HttpError(403, "AD ile y\xF6netici giri\u015Fi sunucuda etkin de\u011Fil.");
     const user = await this.db.collection("users").findOne({ _id: session.userId }, { projection: { id: 1, name: 1, email: 1 } });
     if (!user || !this.emails.includes(user.email)) throw new HttpError(403, "Y\xF6netici yetkisi kald\u0131r\u0131lm\u0131\u015F.");
     return { id: user.id, name: user.name, email: user.email };
+  }
+  async loginAd(proof) {
+    if (!this.ad) throw new HttpError(503, "Sunucuda Windows hesab\u0131yla y\xF6netici giri\u015Fi hen\xFCz etkinle\u015Ftirilmedi.");
+    const verified = this.ad.verify(proof), now = /* @__PURE__ */ new Date();
+    await this.store.rateLimit("admin-ad:" + verified.user.id, 30);
+    try {
+      await this.db.collection("admin_ad_proofs").insertOne({ _id: tokenHash(this.ad.issuer + ":" + verified.jti), expiresAt: new Date(verified.proofExpiresAt.getTime() + 6e4) });
+    } catch (failure) {
+      if (failure instanceof import_mongodb4.MongoServerError && failure.code === 11e3) throw new HttpError(409, "Bu giri\u015F belgesi kullan\u0131lm\u0131\u015F. Yeniden giri\u015F yap.");
+      throw failure;
+    }
+    const token = (0, import_node_crypto7.randomBytes)(32).toString("hex"), expiresAt = new Date(Math.min(now.getTime() + 15 * 6e4, verified.proofExpiresAt.getTime() + 10 * 6e4));
+    await this.db.collection("admin_auth_sessions").insertOne({ _id: tokenHash(token), provider: "ad", principal: verified.user, userId: verified.user.id, issuer: this.ad.issuer, groupSid: this.ad.groupSid, kid: verified.kid, createdAt: now, expiresAt });
+    return { user: verified.user, token, expiresAt: expiresAt.toISOString(), expiresInSeconds: Math.max(1, Math.floor((expiresAt.getTime() - Date.now()) / 1e3)) };
   }
   async logout(token) {
     await this.db.collection("admin_auth_sessions").deleteOne({ _id: tokenHash(token) });
@@ -1541,12 +1567,16 @@ function createIdentityServer(store, options) {
           status: "ok",
           service: "nodera-identity",
           version: "0.5.0",
-          capabilities: ["marketplace", "rdp-relay", "admin-monitoring-v1", "host-inventory-v1", ...directory ? ["directory-v1", "directory-marketplace-v1", "windows-account-profile-v1"] : []]
+          capabilities: ["marketplace", "rdp-relay", "admin-monitoring-v1", "host-inventory-v1", ...options.adminAd ? ["admin-ad-auth-v1"] : [], ...directory ? ["directory-v1", "directory-marketplace-v1", "windows-account-profile-v1"] : []]
         });
         return;
       }
       if (req.headers.origin)
         throw new HttpError(403, "Bu kayna\u011Fa izin verilmiyor.");
+      if (route === "GET /v1/admin/auth-config") {
+        json(200, options.adminAd?.config() ?? { provider: "membership" });
+        return;
+      }
       if (route.startsWith("POST /v1/ad-agent/")) {
         const token2 = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1] ?? "";
         if (!directory || !directory.authenticate(token2)) throw new HttpError(403, "Arac\u0131 yetkisi do\u011Frulanamad\u0131.");
@@ -1559,7 +1589,7 @@ function createIdentityServer(store, options) {
         json(200, await directory.complete(jobId, await readBody(req, 262144)));
         return;
       }
-      if (route === "POST /v1/auth/register" || route === "POST /v1/auth/login" || route === "POST /v1/admin/login") {
+      if (route === "POST /v1/auth/register" || route === "POST /v1/auth/login" || route === "POST /v1/admin/login" || route === "POST /v1/admin/ad-login") {
         let address = req.socket.remoteAddress ?? "unknown";
         if (options.trustProxy) {
           const forwarded = req.headers["x-forwarded-for"];
@@ -1571,6 +1601,11 @@ function createIdentityServer(store, options) {
         const key = (scope) => (0, import_node_crypto8.createHmac)("sha256", options.rateSecret).update(scope).digest("hex");
         await store.rateLimit(key(`ip:${address}`), 60);
         const body = await readBody(req);
+        if (route === "POST /v1/admin/ad-login") {
+          if (Object.keys(body).length !== 1 || typeof body.proof !== "string") throw new HttpError(400, "Yaln\u0131zca DC1 giri\u015F belgesi kabul edilir.");
+          json(200, await admin.loginAd(body.proof));
+          return;
+        }
         if (body.remember !== void 0 && typeof body.remember !== "boolean")
           throw new HttpError(400, "Oturum saklama se\xE7imi ge\xE7ersiz.");
         let email, password;
@@ -1714,7 +1749,7 @@ function createIdentityServer(store, options) {
     }
   });
   const relay = createRentalRelay(server, store, options.rateSecret, directory);
-  const admin = new AdminService(store, options.adminEmails ?? [], relay.online, !!directory);
+  const admin = new AdminService(store, options.adminEmails ?? [], relay.online, !!directory, options.adminAd);
   server.requestTimeout = 15e3;
   server.headersTimeout = 1e4;
   server.maxHeadersCount = 40;
@@ -1740,6 +1775,86 @@ async function readBody(req, limit = 16384) {
   }
 }
 
+// apps/api/src/admin-ad.ts
+var import_node_crypto9 = require("node:crypto");
+var sid = /^S-1-5-21-\d+-\d+-\d+-\d+$/;
+var guid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+function object(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("object");
+  return value;
+}
+function decode(value, max) {
+  if (!/^[A-Za-z0-9_-]+$/.test(value) || value.length > max) throw new Error("encoding");
+  const data = Buffer.from(value, "base64url");
+  if (data.toString("base64url") !== value) throw new Error("encoding");
+  return data;
+}
+function text(value, max) {
+  return typeof value === "string" && value.length > 0 && value.length <= max && !/[\x00-\x1f\x7f]/.test(value);
+}
+var AdminAdVerifier = class {
+  issuer;
+  audience;
+  groupSid;
+  keys = /* @__PURE__ */ new Map();
+  constructor(input) {
+    try {
+      const trust = object(input), uri = new URL(trust.issuer);
+      if (uri.protocol !== "https:" || uri.username || uri.password || uri.search || uri.hash || uri.pathname !== "/nodera-auth" || uri.href !== trust.issuer || trust.audience !== "urn:nodera:admin" || !sid.test(trust.groupSid)) throw new Error("trust");
+      this.issuer = trust.issuer;
+      this.audience = trust.audience;
+      this.groupSid = trust.groupSid;
+      const keys = object(trust.jwks).keys;
+      if (!Array.isArray(keys) || !keys.length || keys.length > 8) throw new Error("keys");
+      for (const inputKey of keys) {
+        const key = object(inputKey);
+        if (Object.keys(key).some((k) => !["kty", "use", "alg", "kid", "n", "e"].includes(k)) || key.kty !== "RSA" || key.alg !== "RS256" || key.use !== "sig" || !/^[a-f0-9]{64}$/.test(key.kid) || this.keys.has(key.kid)) throw new Error("key");
+        decode(key.n, 1400);
+        decode(key.e, 12);
+        const publicKey = (0, import_node_crypto9.createPublicKey)({ key: { kty: "RSA", n: key.n, e: key.e }, format: "jwk" });
+        const size = publicKey.asymmetricKeyDetails?.modulusLength ?? 0;
+        if (publicKey.asymmetricKeyType !== "rsa" || size < 2048 || size > 8192) throw new Error("key size");
+        this.keys.set(key.kid, publicKey);
+      }
+    } catch {
+      throw new IdentityStartupError("CONFIG_ADMIN_AD");
+    }
+  }
+  config() {
+    return { provider: "ad", issuer: this.issuer, audience: this.audience, groupSid: this.groupSid, keyIds: [...this.keys.keys()], sessionMinutes: 15 };
+  }
+  accepts(kid, issuer, groupSid) {
+    return issuer === this.issuer && groupSid === this.groupSid && this.keys.has(kid);
+  }
+  verify(proof, now = Math.floor(Date.now() / 1e3)) {
+    try {
+      if (typeof proof !== "string" || proof.length > 8192) throw new Error("proof");
+      const parts = proof.split(".");
+      if (parts.length !== 3) throw new Error("format");
+      const header = object(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decode(parts[0], 1024))));
+      if (Object.keys(header).some((k) => !["alg", "typ", "kid"].includes(k)) || header.alg !== "RS256" || header.typ !== "JWT") throw new Error("algorithm");
+      const key = this.keys.get(header.kid);
+      if (!key || !(0, import_node_crypto9.verify)("RSA-SHA256", Buffer.from(parts[0] + "." + parts[1], "ascii"), key, decode(parts[2], 1400))) throw new Error("signature");
+      const claims = object(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decode(parts[1], 6e3))));
+      if (claims.iss !== this.issuer || claims.aud !== this.audience || !sid.test(claims.sub) || !guid.test(claims.jti) || ![claims.iat, claims.nbf, claims.exp].every(Number.isSafeInteger) || claims.iat > now + 30 || claims.nbf > now + 30 || claims.nbf !== claims.iat || claims.exp <= now || claims.exp <= claims.iat || claims.exp - claims.iat > 300 || now - claims.iat > 300 || !Array.isArray(claims.groups) || !claims.groups.includes(this.groupSid) || !Array.isArray(claims.amr) || !claims.amr.includes("pwd") || !claims.amr.includes("ad-network") || !text(claims.username, 80) || !/^NODERA\\[A-Za-z0-9][A-Za-z0-9._-]{0,19}$/i.test(claims.username) || !text(claims.name, 200)) throw new Error("claims");
+      const user = { id: "ad:" + claims.sub, name: claims.name, email: "", username: claims.username, provider: "ad" };
+      return { user, jti: claims.jti, kid: header.kid, proofExpiresAt: new Date(claims.exp * 1e3) };
+    } catch {
+      throw new HttpError(401, "DC1 giri\u015F belgesi do\u011Frulanamad\u0131 veya s\xFCresi doldu. Yeniden giri\u015F yap.");
+    }
+  }
+};
+function adminAdOptions(env = process.env) {
+  const mode = env.NODERA_ADMIN_AUTH_MODE ?? "membership", value = env.NODERA_ADMIN_AD_TRUST?.trim();
+  if (mode === "membership" && !value) return;
+  if (mode !== "ad" || !value || value.length > 2e4) throw new IdentityStartupError("CONFIG_ADMIN_AD");
+  try {
+    return new AdminAdVerifier(JSON.parse(value));
+  } catch {
+    throw new IdentityStartupError("CONFIG_ADMIN_AD");
+  }
+}
+
 // apps/api/src/index.ts
 async function main() {
   const port = Number(process.env.PORT ?? 8080);
@@ -1747,6 +1862,7 @@ async function main() {
     throw new IdentityStartupError("CONFIG_PORT");
   const rateSecret = process.env.AUTH_RATE_SECRET ?? "";
   if (rateSecret.length < 32) throw new IdentityStartupError("CONFIG_SECRET");
+  const adminAd = adminAdOptions();
   const { store, client } = await connectAccounts(
     process.env.MONGODB_URI ?? "",
     process.env.MONGODB_DATABASE ?? "nodera"
@@ -1755,7 +1871,8 @@ async function main() {
     rateSecret,
     trustProxy: process.env.TRUST_PROXY === "1",
     directory: directoryOptions(),
-    adminEmails: adminEmails(process.env.NODERA_ADMIN_EMAILS)
+    adminEmails: adminEmails(process.env.NODERA_ADMIN_EMAILS),
+    adminAd
   });
   server.listen(
     port,
