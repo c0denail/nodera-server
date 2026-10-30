@@ -23,7 +23,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 
 // apps/api/src/store.ts
-var import_node_crypto4 = require("node:crypto");
+var import_node_crypto5 = require("node:crypto");
 var import_mongodb3 = require("mongodb");
 
 // packages/shared/src/errors.ts
@@ -236,6 +236,7 @@ var MarketplaceStore = class {
       guestId: user.id,
       guestName: user.name,
       phase: "reserved",
+      reservedAt: /* @__PURE__ */ new Date(),
       expiresAt: new Date(Date.now() + 12e4),
       ...durationMinutes ? { durationMinutes } : {}
     };
@@ -287,6 +288,14 @@ var MarketplaceStore = class {
             listingId: listing._id,
             ownerId: listing.ownerId,
             guestId: listing.lease.guestId,
+            guestName: listing.lease.guestName,
+            ownerName: listing.ownerName,
+            machineId: listing.machineId,
+            machineName: listing.name,
+            ...listing.lease.reservedAt ? { reservedAt: listing.lease.reservedAt } : {},
+            ...listing.lease.startedAt ? { startedAt: listing.lease.startedAt } : {},
+            expiresAt: listing.lease.expiresAt,
+            ...listing.lease.durationMinutes ? { durationMinutes: listing.lease.durationMinutes } : {},
             endedAt: /* @__PURE__ */ new Date()
           }
         },
@@ -342,7 +351,7 @@ var MarketplaceStore = class {
 };
 
 // apps/api/src/directory.ts
-var import_node_crypto3 = require("node:crypto");
+var import_node_crypto4 = require("node:crypto");
 var import_mongodb2 = require("mongodb");
 
 // packages/shared/src/directory.ts
@@ -363,6 +372,35 @@ function readWindowsAccountProfile(value) {
 }
 var directoryUuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 var windowsUsername = /^[a-z][a-z0-9_-]{2,19}$/;
+
+// apps/api/src/observability.ts
+var import_node_crypto3 = require("node:crypto");
+
+// packages/shared/src/admin.ts
+function safeDiagnostic(input) {
+  return (typeof input === "string" ? input : "\u0130\u015Flem tamamlanamad\u0131.").slice(0, 6e3).replace(/(?:mongodb(?:\+srv)?|https?|wss?):\/\/[^\s<>"']+/gi, "[adres gizlendi]").replace(/(?:Bearer\s+|tskey-)[\w.-]+/gi, "[anahtar gizlendi]").replace(/\b[a-f0-9]{64,}\b/gi, "[gizli de\u011Fer]").replace(/(<(?:Password|Value)>)[\s\S]*?(<\/(?:Password|Value)>)/gi, "$1[gizlendi]$2").replace(/((?:password|passwd|parola|şifre|secret|token|authkey|client_secret|connectionstring)["']?\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1[gizlendi]").replace(/[A-Z]:\\(?:Users|Documents and Settings)\\[^\s<>"']+/gi, "[yerel dosya]").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "").slice(0, 1200);
+}
+
+// apps/api/src/observability.ts
+async function initializeObservability(db) {
+  await Promise.all([
+    db.collection("admin_events").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+    db.collection("admin_events").createIndex({ createdAt: -1, userId: 1 }),
+    db.collection("machine_inventory").createIndex({ ownerId: 1, deviceId: 1, machineId: 1 }, { unique: true }),
+    db.collection("admin_auth_sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+  ]);
+}
+async function recordDiagnostic(db, event) {
+  const now = /* @__PURE__ */ new Date();
+  const id = (0, import_node_crypto3.createHash)("sha256").update(`${event.userId}:${event.deviceId ?? event.source}:${event.id ?? (0, import_node_crypto3.randomUUID)()}`).digest("hex");
+  const { id: _id, message, ...fields } = event;
+  await db.collection("admin_events").updateOne({ _id: id }, { $setOnInsert: {
+    ...fields,
+    message: safeDiagnostic(message),
+    createdAt: now,
+    expiresAt: new Date(now.getTime() + 90 * 864e5)
+  } }, { upsert: true });
+}
 
 // apps/api/src/directory.ts
 function directoryOptions(env = process.env) {
@@ -410,15 +448,15 @@ var DirectoryService = class {
     return agent?.seenAt instanceof Date && agent.seenAt.getTime() > Date.now() - 12e4;
   }
   seal(value) {
-    const iv = (0, import_node_crypto3.randomBytes)(12), cipher = (0, import_node_crypto3.createCipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), iv);
+    const iv = (0, import_node_crypto4.randomBytes)(12), cipher = (0, import_node_crypto4.createCipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), iv);
     return Buffer.concat([iv, cipher.update(JSON.stringify(value)), cipher.final(), cipher.getAuthTag()]).toString("base64");
   }
   open(value) {
-    const data = Buffer.from(value, "base64"), decipher = (0, import_node_crypto3.createDecipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), data.subarray(0, 12));
+    const data = Buffer.from(value, "base64"), decipher = (0, import_node_crypto4.createDecipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), data.subarray(0, 12));
     decipher.setAuthTag(data.subarray(-16));
     return JSON.parse(Buffer.concat([decipher.update(data.subarray(12, -16)), decipher.final()]).toString("utf8"));
   }
-  async enqueue(kind, ownerId, payload, machine, id = (0, import_node_crypto3.randomUUID)()) {
+  async enqueue(kind, ownerId, payload, machine, id = (0, import_node_crypto4.randomUUID)()) {
     const job = { _id: id, kind, ownerId, ...machine ? { machineId: machine.machineId, generation: machine.generation } : {}, encrypted: this.seal(payload), status: "queued", createdAt: /* @__PURE__ */ new Date(), expiresAt: new Date(Date.now() + 30 * 6e4) };
     await this.jobs.insertOne(job);
     return id;
@@ -474,7 +512,7 @@ var DirectoryService = class {
     }
     if (!existing && (password === void 0 || !profile)) throw new HttpError(400, "Yeni Windows hesab\u0131 i\xE7in ad, soyad, e-posta ve parola gerekli.");
     if (existing && password === void 0 && body.profile === void 0) throw new HttpError(400, "G\xFCncellenecek Windows hesab\u0131 bilgilerini gir.");
-    const jobId = (0, import_node_crypto3.randomUUID)();
+    const jobId = (0, import_node_crypto4.randomUUID)();
     try {
       if (existing) {
         const saved = await this.accounts.updateOne({ _id: user.id, jobId: existing.jobId, state: { $ne: "pending" } }, { $set: { state: "pending", jobId, changedAt: /* @__PURE__ */ new Date(), ...profile ? { profile } : {} }, $unset: { error: "" } });
@@ -503,7 +541,7 @@ var DirectoryService = class {
       if (current.phase === "cleaning" || current.phase === "failed") throw new HttpError(409, "\xD6nce \xF6nceki AD/VPN haz\u0131rl\u0131\u011F\u0131n\u0131 temizleyin.");
       return this.publicMachine(current);
     }
-    const generation = (0, import_node_crypto3.randomUUID)(), jobId = (0, import_node_crypto3.randomUUID)();
+    const generation = (0, import_node_crypto4.randomUUID)(), jobId = (0, import_node_crypto4.randomUUID)();
     const doc = { _id: machineId, machineId, deviceId, ownerId: user.id, generation, computerName: "ND-" + generation.replaceAll("-", "").slice(0, 12).toUpperCase(), phase: "preparing", jobId, changedAt: /* @__PURE__ */ new Date() };
     await this.machines.insertOne(doc);
     await this.enqueue("provision", user.id, { ...this.publicMachine(doc), ownerId: user.id }, doc, jobId);
@@ -519,7 +557,7 @@ var DirectoryService = class {
     if (body.generation !== machine.generation || body.computerName !== machine.computerName || body.domain !== this.options.domain || body.secureChannel !== true || body.nla !== true) throw new HttpError(409, "VM'nin domain ve ba\u011Flant\u0131 kan\u0131t\u0131 uyu\u015Fmuyor.");
     if (machine.phase === "ready" || machine.phase === "verifying") return this.publicMachine(machine);
     if (machine.phase !== "joining") throw new HttpError(409, "VM domain kat\u0131l\u0131m\u0131 i\xE7in haz\u0131r de\u011Fil.");
-    const jobId = (0, import_node_crypto3.randomUUID)();
+    const jobId = (0, import_node_crypto4.randomUUID)();
     const changed = await this.machines.updateOne({ _id: id, generation: machine.generation, phase: "joining" }, { $set: { phase: "verifying", jobId, changedAt: /* @__PURE__ */ new Date() } });
     if (changed.modifiedCount) await this.enqueue("verify", user.id, { ...this.publicMachine(machine), ownerId: user.id, computerGuid: machine.computerGuid }, machine, jobId);
     return this.publicMachine(await this.owned(user.id, id));
@@ -528,7 +566,7 @@ var DirectoryService = class {
     if (await this.db.collection("rental_listings").findOne({ ownerId: userId, machineId: id, resetRequired: false, "lease.phase": { $in: ["reserved", "active"] } }, { projection: { _id: 1 } })) throw new HttpError(409, "Aktif kiralama bitmeden makinenin AD/VPN kimli\u011Fi temizlenemez.");
     const machine = await this.owned(userId, id);
     if (machine.phase === "cleaning") return this.publicMachine(machine);
-    const jobId = (0, import_node_crypto3.randomUUID)();
+    const jobId = (0, import_node_crypto4.randomUUID)();
     const saved = await this.machines.updateOne({ _id: id, generation: machine.generation, jobId: machine.jobId }, { $set: { phase: "cleaning", jobId, changedAt: /* @__PURE__ */ new Date() } });
     if (saved.modifiedCount) await this.enqueue("cleanup", userId, { ...this.publicMachine(machine), ownerId: userId, computerGuid: machine.computerGuid, deviceNodeId: machine.deviceNodeId }, machine, jobId);
     return this.publicMachine(await this.owned(userId, id));
@@ -550,11 +588,11 @@ var DirectoryService = class {
     return job.status === "done";
   }
   authenticate(token) {
-    return (0, import_node_crypto3.timingSafeEqual)((0, import_node_crypto3.createHash)("sha256").update(token).digest(), (0, import_node_crypto3.createHash)("sha256").update(this.options.agentToken).digest());
+    return (0, import_node_crypto4.timingSafeEqual)((0, import_node_crypto4.createHash)("sha256").update(token).digest(), (0, import_node_crypto4.createHash)("sha256").update(this.options.agentToken).digest());
   }
   async claim() {
     await this.db.collection("directory_agent").updateOne({ name: "dc1" }, { $set: { seenAt: /* @__PURE__ */ new Date() } }, { upsert: true });
-    const claim = (0, import_node_crypto3.randomBytes)(32).toString("hex"), now = /* @__PURE__ */ new Date();
+    const claim = (0, import_node_crypto4.randomBytes)(32).toString("hex"), now = /* @__PURE__ */ new Date();
     const job = await this.jobs.findOneAndUpdate({ expiresAt: { $gt: now }, $or: [{ status: "queued" }, { status: "running", claimUntil: { $lt: now } }] }, { $set: { status: "running", claim, claimUntil: new Date(Date.now() + 18e4) } }, { sort: { createdAt: 1 }, returnDocument: "after" });
     if (!job) return null;
     const current = job.kind === "account" ? await this.accounts.findOne({ _id: job.ownerId, jobId: job._id }) : job.machineId ? await this.machines.findOne({ _id: job.machineId, generation: job.generation, ...job.kind === "grant" ? { phase: "ready" } : { jobId: job._id } }) : null;
@@ -594,6 +632,8 @@ var DirectoryService = class {
     const error = codes[String(result.code)] ?? "AD arac\u0131s\u0131 i\u015Flemi tamamlayamad\u0131. DC1 \xFCzerindeki Nodera AD hizmetini ve ilgili OU yetkilerini kontrol edin.";
     const saved = await this.jobs.updateOne({ _id: id, status: "running", claim: body.claim }, { $set: { status: body.success ? "done" : "failed", ...body.success ? { result: this.seal(result) } : { error } }, $unset: { encrypted: "", claim: "" } });
     if (!saved.modifiedCount) throw new HttpError(409, "AD sonucu zaten i\u015Flendi.");
+    if (!body.success) await recordDiagnostic(this.db, { id, userId: job.ownerId, source: "ad-agent", category: "directory", code: Object.hasOwn(codes, String(result.code)) ? String(result.code) : "ND_DIRECTORY_AGENT", message: error, operation: job.kind, jobId: id, ...job.machineId ? { machineId: job.machineId } : {} }).catch(() => {
+    });
     await this.reconcile(await this.jobs.findOne({ _id: id }));
     return { ok: true };
   }
@@ -640,6 +680,7 @@ var AccountStore = class {
   async initialize() {
     await initializeMarketplace(this.db);
     await initializeDirectory(this.db);
+    await initializeObservability(this.db);
     await this.accounts.createIndex(
       { email: 1 },
       { unique: true, name: "unique_email" }
@@ -686,7 +727,7 @@ var AccountStore = class {
       );
   }
   async register(name, email, password, remember = false) {
-    const id = (0, import_node_crypto4.randomUUID)();
+    const id = (0, import_node_crypto5.randomUUID)();
     const account = {
       _id: id,
       id,
@@ -705,6 +746,10 @@ var AccountStore = class {
     return this.issueSession(account, remember);
   }
   async login(email, password, remember = false) {
+    const user = await this.verifyCredentials(email, password);
+    return this.issueSession(user, remember);
+  }
+  async verifyCredentials(email, password) {
     const account = await this.accounts.findOne({ email });
     const valid = await verifyPassword(
       password,
@@ -712,10 +757,10 @@ var AccountStore = class {
     );
     if (!account || !valid)
       throw new HttpError(401, "E-posta veya parola hatal\u0131.");
-    return this.issueSession(account, remember);
+    return publicUser(account);
   }
   async issueSession(account, remember) {
-    const token = (0, import_node_crypto4.randomBytes)(32).toString("hex");
+    const token = (0, import_node_crypto5.randomBytes)(32).toString("hex");
     const expiresAt = new Date(Date.now() + (remember ? 30 : 1) * 864e5);
     await this.sessions.insertOne({
       _id: tokenHash(token),
@@ -771,12 +816,12 @@ async function connectAccounts(uri, databaseName) {
 
 // apps/api/src/app.ts
 var import_node_http = __toESM(require("node:http"), 1);
-var import_node_crypto6 = require("node:crypto");
+var import_node_crypto8 = require("node:crypto");
 var import_node_net = require("node:net");
 
 // apps/api/src/relay.ts
 var import_ws = require("ws");
-var import_node_crypto5 = require("node:crypto");
+var import_node_crypto6 = require("node:crypto");
 
 // packages/shared/src/marketplace-filters.ts
 var marketResources = ["cpu", "memory", "storage"];
@@ -1019,7 +1064,11 @@ function createRentalRelay(server, accounts, rateSecret, directory) {
             {
               $set: {
                 "lease.phase": "active",
-                ...item.directoryGeneration ? {} : { "lease.expiresAt": new Date(Date.now() + 60 * 6e4) }
+                ...item.directoryGeneration ? {} : {
+                  "lease.startedAt": item.lease.startedAt ?? /* @__PURE__ */ new Date(),
+                  "lease.expiresAt": item.lease.startedAt ? item.lease.expiresAt : new Date(Date.now() + 60 * 6e4),
+                  "lease.durationMinutes": 60
+                }
               }
             }
           ).then((result) => {
@@ -1091,6 +1140,7 @@ function createRentalRelay(server, accounts, rateSecret, directory) {
   };
   server.on("close", stop);
   return {
+    online,
     stop,
     market,
     async handle(user, method, pathname, body, params = new URLSearchParams()) {
@@ -1168,7 +1218,7 @@ function createRentalRelay(server, accounts, rateSecret, directory) {
       );
       if (method === "POST" && action) {
         await accounts.rateLimit(
-          (0, import_node_crypto5.createHmac)("sha256", rateSecret).update(`rental:${user.id}`).digest("hex"),
+          (0, import_node_crypto6.createHmac)("sha256", rateSecret).update(`rental:${user.id}`).digest("hex"),
           60
         );
         const item = await market.listings.findOne({ _id: action[1] });
@@ -1255,12 +1305,224 @@ function createRentalRelay(server, accounts, rateSecret, directory) {
   };
 }
 
+// apps/api/src/admin.ts
+var import_node_crypto7 = require("node:crypto");
+function adminEmails(value = "") {
+  const emails = value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  if (emails.some((x) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x) || x.length > 254) || emails.length > 20)
+    throw new Error("NODERA_ADMIN_EMAILS ge\xE7erli y\xF6netici e-posta adresleri i\xE7ermeli.");
+  return [...new Set(emails)];
+}
+var userLookup = [
+  { $lookup: { from: "users", localField: "ownerId", foreignField: "_id", pipeline: [{ $project: { _id: 0, id: 1, name: 1, email: 1 } }], as: "owner" } },
+  { $set: { owner: { $first: "$owner" } } }
+];
+function machinePipeline() {
+  return [
+    { $project: { _id: 0, machineId: 1, ownerId: 1, deviceId: 1, name: 1, cpu: 1, memory: 1, storage: 1, network: 1, status: 1, runtimeState: 1, windowsPrepared: 1, createdAt: 1, seenAt: 1, deletedAt: 1, source: { $literal: "inventory" } } },
+    { $unionWith: { coll: "rental_listings", pipeline: [{ $project: { _id: 0, machineId: 1, ownerId: 1, deviceId: 1, name: 1, cpu: 1, memory: 1, storage: 1, network: 1, published: 1, resetRequired: 1, lease: 1, listingId: "$_id", source: { $literal: "listing" } } }] } },
+    { $unionWith: { coll: "directory_machines", pipeline: [{ $project: { _id: 0, machineId: 1, ownerId: 1, deviceId: 1, computerName: 1, directoryPhase: "$phase", directoryError: "$error", source: { $literal: "directory" } } }] } },
+    { $group: { _id: { ownerId: "$ownerId", machineId: "$machineId" }, records: { $push: "$$ROOT" } } },
+    { $set: Object.fromEntries(["directory", "listing", "inventory"].map((source) => [source, { $first: { $filter: { input: "$records", as: "r", cond: { $eq: ["$$r.source", source] } } } }])) },
+    { $replaceWith: { $mergeObjects: ["$directory", "$listing", "$inventory"] } },
+    ...userLookup
+  ];
+}
+function rentalPipeline() {
+  return [
+    { $project: { _id: 0, leaseId: 1, listingId: 1, machineId: 1, machineName: 1, ownerId: 1, guestId: 1, guestName: 1, ownerName: 1, reservedAt: 1, startedAt: 1, expiresAt: 1, endedAt: 1, durationMinutes: 1, phase: { $literal: "ended" } } },
+    { $unionWith: { coll: "rental_listings", pipeline: [
+      { $match: { "lease.id": { $type: "string" } } },
+      { $project: { _id: 0, leaseId: "$lease.id", listingId: "$_id", machineId: 1, machineName: "$name", ownerId: 1, ownerName: 1, guestId: "$lease.guestId", guestName: "$lease.guestName", reservedAt: "$lease.reservedAt", startedAt: "$lease.startedAt", expiresAt: "$lease.expiresAt", durationMinutes: "$lease.durationMinutes", phase: "$lease.phase" } }
+    ] } },
+    // History and a resetting listing represent the same rental. Merge rather than double count.
+    { $sort: { phase: 1 } },
+    { $group: { _id: "$leaseId", row: { $mergeObjects: "$$ROOT" } } },
+    { $replaceWith: "$row" },
+    ...userLookup,
+    { $lookup: { from: "users", localField: "guestId", foreignField: "_id", pipeline: [{ $project: { _id: 0, id: 1, name: 1, email: 1 } }], as: "guest" } },
+    { $set: { guest: { $first: "$guest" }, sortAt: { $ifNull: ["$startedAt", { $ifNull: ["$reservedAt", "$endedAt"] }] } } }
+  ];
+}
+var escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function pageOptions(query) {
+  const page = Number(query.get("page") ?? "1"), pageSize = Number(query.get("pageSize") ?? "25");
+  if (!Number.isSafeInteger(page) || page < 1 || page > 1e4 || ![10, 25, 50].includes(pageSize)) throw new HttpError(400, "Sayfa se\xE7imi ge\xE7ersiz.");
+  const search = (query.get("q") ?? "").trim();
+  if (search.length > 100) throw new HttpError(400, "Arama en fazla 100 karakter olabilir.");
+  const userId = query.get("userId");
+  if (userId && !uuid.test(userId)) throw new HttpError(400, "Kullan\u0131c\u0131 kimli\u011Fi ge\xE7ersiz.");
+  return { page, pageSize, search, userId, status: query.get("status") ?? "" };
+}
+var AdminService = class {
+  constructor(store, emails, online, directoryEnabled) {
+    this.store = store;
+    this.emails = emails;
+    this.online = online;
+    this.directoryEnabled = directoryEnabled;
+  }
+  store;
+  emails;
+  online;
+  directoryEnabled;
+  get db() {
+    return this.store.database;
+  }
+  async login(email, password) {
+    const user = await this.store.verifyCredentials(email, password);
+    if (!this.emails.includes(user.email)) throw new HttpError(403, "Bu hesab\u0131n y\xF6netici eri\u015Fimi yok. Sunucudaki y\xF6netici listesine eklenmesi gerekiyor.");
+    const token = (0, import_node_crypto7.randomBytes)(32).toString("hex"), expiresAt = new Date(Date.now() + 8 * 36e5);
+    await this.db.collection("admin_auth_sessions").insertOne({ _id: tokenHash(token), userId: user.id, expiresAt });
+    return { user, token, expiresAt: expiresAt.toISOString() };
+  }
+  async userFor(token) {
+    const session = await this.db.collection("admin_auth_sessions").findOne({ _id: tokenHash(token), expiresAt: { $gt: /* @__PURE__ */ new Date() } });
+    if (!session) throw new HttpError(401, "Y\xF6netici oturumu sona erdi. Yeniden giri\u015F yap.");
+    const user = await this.db.collection("users").findOne({ _id: session.userId }, { projection: { id: 1, name: 1, email: 1 } });
+    if (!user || !this.emails.includes(user.email)) throw new HttpError(403, "Y\xF6netici yetkisi kald\u0131r\u0131lm\u0131\u015F.");
+    return { id: user.id, name: user.name, email: user.email };
+  }
+  async logout(token) {
+    await this.db.collection("admin_auth_sessions").deleteOne({ _id: tokenHash(token) });
+    return { ok: true };
+  }
+  async paginate(collection, pipeline, query, fields, statuses, statusKey, sort, now = /* @__PURE__ */ new Date()) {
+    const { page, pageSize, search, userId, status } = pageOptions(query);
+    const filter = {};
+    if (search) filter.$or = fields.map((field) => ({ [field]: { $regex: escapeRegex(search), $options: "i" } }));
+    if (userId) filter.$and = [{ $or: [{ ownerId: userId }, { guestId: userId }, { userId }, { id: userId }] }];
+    if (status) {
+      if (!statuses.includes(status)) throw new HttpError(400, "Durum filtresi ge\xE7ersiz.");
+      filter[statusKey] = status;
+    }
+    const [result] = await this.db.collection(collection).aggregate([...pipeline, { $match: filter }, { $facet: {
+      items: [{ $sort: sort }, { $skip: (page - 1) * pageSize }, { $limit: pageSize }],
+      total: [{ $count: "count" }]
+    } }], { maxTimeMS: 8e3 }).toArray();
+    return { items: result?.items ?? [], total: result?.total[0]?.count ?? 0, page, pageSize, serverNow: now.toISOString() };
+  }
+  async list(section, query) {
+    const now = /* @__PURE__ */ new Date();
+    if (section === "users") return this.paginate("users", [
+      { $project: { _id: 0, id: 1, name: 1, email: 1, createdAt: 1 } },
+      { $lookup: { from: "directory_accounts", localField: "id", foreignField: "_id", pipeline: [{ $project: { _id: 0, username: 1, state: 1 } }], as: "windowsAccount" } },
+      { $set: { windowsAccount: { $first: "$windowsAccount" } } }
+    ], query, ["name", "email", "id", "windowsAccount.username"], [], "", { createdAt: -1, id: 1 });
+    if (section === "windows-accounts") return this.paginate("directory_accounts", [
+      { $project: { _id: 0, userId: "$_id", ownerId: "$_id", username: 1, domain: 1, state: 1, profile: { givenName: "$profile.givenName", surname: "$profile.surname", email: "$profile.email" }, changedAt: 1 } },
+      ...userLookup
+    ], query, ["username", "profile.givenName", "profile.surname", "profile.email", "owner.name", "owner.email"], ["pending", "ready", "failed"], "state", { changedAt: -1, username: 1 });
+    if (section === "machines") {
+      const result = await this.paginate("machine_inventory", machinePipeline(), query, ["name", "machineId", "computerName", "owner.name", "owner.email"], ["creating", "awaiting_setup", "created", "failed", "stopped", "deleting", "delete_failed"], "status", { seenAt: -1, machineId: 1 }, now);
+      const listings = await this.db.collection("rental_listings").find({ _id: { $in: result.items.map((r) => r.listingId).filter(Boolean) } }, { projection: { ownerId: 1, deviceId: 1, machineId: 1, directoryGeneration: 1 } }).toArray();
+      const active = new Set(listings.filter((l) => this.online(l)).map((l) => l._id));
+      result.items = result.items.map((r) => {
+        const { lease, directoryError, ...safe } = r;
+        return { ...safe, online: active.has(r.listingId), directoryError: directoryError ? safeDiagnostic(directoryError) : void 0, leaseId: lease?.id ?? null };
+      });
+      return result;
+    }
+    if (section === "rentals") {
+      const result = await this.paginate("rental_history", [...rentalPipeline(), { $set: { phase: { $cond: [{ $and: [{ $in: ["$phase", ["active", "reserved"]] }, { $lte: ["$expiresAt", now] }] }, "expired", "$phase"] } } }], query, ["machineName", "machineId", "leaseId", "owner.name", "guest.name", "guest.email"], ["reserved", "active", "resetting", "ended", "expired"], "phase", { sortAt: -1, leaseId: 1 }, now);
+      result.items = result.items.map((r) => ({
+        ...r,
+        remainingSeconds: ["active", "reserved"].includes(r.phase) && r.expiresAt ? Math.max(0, Math.ceil((new Date(r.expiresAt).getTime() - now.getTime()) / 1e3)) : 0,
+        elapsedSeconds: r.startedAt ? Math.max(0, Math.floor((Math.min(now.getTime(), new Date(r.endedAt ?? r.expiresAt ?? now).getTime()) - new Date(r.startedAt).getTime()) / 1e3)) : null
+      }));
+      return result;
+    }
+    if (section === "errors") return this.paginate("admin_events", [
+      { $project: { _id: 0, id: "$_id", ownerId: "$userId", deviceId: 1, machineId: 1, leaseId: 1, jobId: 1, source: 1, category: 1, code: 1, message: 1, operation: 1, createdAt: 1, observedAt: 1 } },
+      ...userLookup
+    ], query, ["message", "code", "machineId", "jobId", "owner.name", "owner.email"], ["installation", "rental", "directory", "system"], "category", { createdAt: -1, id: 1 });
+    throw new HttpError(404, "Y\xF6netim ekran\u0131 bulunamad\u0131.");
+  }
+  async overview() {
+    const now = /* @__PURE__ */ new Date();
+    const [users, machines, windowsAccounts, activeRentals, errors24h, listings, agent, recentErrors, recentRentals] = await Promise.all([
+      this.db.collection("users").countDocuments(),
+      this.db.collection("machine_inventory").aggregate([...machinePipeline(), { $match: { deletedAt: { $exists: false }, $or: [{ source: { $ne: "listing" } }, { published: true }] } }, { $count: "count" }]).toArray(),
+      this.db.collection("directory_accounts").countDocuments(),
+      this.db.collection("rental_listings").countDocuments({ "lease.phase": "active", "lease.expiresAt": { $gt: now } }),
+      this.db.collection("admin_events").countDocuments({ createdAt: { $gte: new Date(now.getTime() - 864e5) } }),
+      this.db.collection("rental_listings").find({ published: true }, { projection: { ownerId: 1, deviceId: 1, machineId: 1, directoryGeneration: 1 } }).toArray(),
+      this.db.collection("directory_agent").findOne({ name: "dc1" }, { projection: { seenAt: 1 } }),
+      this.list("errors", new URLSearchParams("pageSize=10")),
+      this.list("rentals", new URLSearchParams("pageSize=10"))
+    ]);
+    return {
+      serverNow: now.toISOString(),
+      users,
+      machines: machines[0]?.count ?? 0,
+      windowsAccounts,
+      activeRentals,
+      errors24h,
+      onlineMachines: listings.filter((l) => this.online(l)).length,
+      publishedMachines: listings.length,
+      directoryEnabled: this.directoryEnabled,
+      agentOnline: !!agent?.seenAt && agent.seenAt.getTime() > now.getTime() - 12e4,
+      agentSeenAt: agent?.seenAt ?? null,
+      recentErrors: recentErrors.items.slice(0, 5),
+      recentRentals: recentRentals.items.slice(0, 5)
+    };
+  }
+};
+async function receiveInventory(db, user, body) {
+  if (typeof body.deviceId !== "string" || !uuid.test(body.deviceId) || !Array.isArray(body.machines) || body.machines.length > 500 || !Array.isArray(body.errors) || body.errors.length > 100)
+    throw new HttpError(400, "Makine raporu ge\xE7ersiz.");
+  const now = /* @__PURE__ */ new Date(), deviceId = body.deviceId, seen = /* @__PURE__ */ new Set();
+  const machines = body.machines.map((m) => {
+    if (!m || typeof m.id !== "string" || !uuid.test(m.id) || seen.has(m.id) || typeof m.name !== "string" || m.name.length > 48 || !["awaiting_setup", "creating", "created", "failed", "stopped", "deleting", "delete_failed"].includes(m.status)) throw new HttpError(400, "Makine raporu ge\xE7ersiz.");
+    for (const key of ["cpu", "memory", "storage", "network"]) if (!Number.isFinite(m[key]) || m[key] < 0 || m[key] > 1048576) throw new HttpError(400, "Kaynak raporu ge\xE7ersiz.");
+    seen.add(m.id);
+    return {
+      machineId: m.id,
+      ownerId: user.id,
+      deviceId,
+      name: m.name.replace(/[\x00-\x1f]/g, ""),
+      cpu: m.cpu,
+      memory: m.memory,
+      storage: m.storage,
+      network: m.network,
+      status: m.status,
+      runtimeState: typeof m.runtimeState === "string" ? m.runtimeState.slice(0, 40) : null,
+      windowsPrepared: m.windowsPrepared === true,
+      ...typeof m.createdAt === "string" && Number.isFinite(Date.parse(m.createdAt)) ? { createdAt: new Date(m.createdAt) } : {},
+      seenAt: now
+    };
+  });
+  const errors = body.errors.map((e) => {
+    if (!e || typeof e.id !== "string" || !uuid.test(e.id) || typeof e.message !== "string" || e.message.length > 6e3 || !["installation", "rental", "directory", "system"].includes(e.category) || e.machineId !== void 0 && (typeof e.machineId !== "string" || !uuid.test(e.machineId)) || e.jobId !== void 0 && (typeof e.jobId !== "string" || !uuid.test(e.jobId))) throw new HttpError(400, "Hata raporu ge\xE7ersiz.");
+    if (e.leaseId !== void 0 && (typeof e.leaseId !== "string" || !uuid.test(e.leaseId))) throw new HttpError(400, "Kiralama bildirimi ge\xE7ersiz.");
+    return {
+      id: e.id,
+      userId: user.id,
+      deviceId,
+      source: "desktop",
+      category: e.category,
+      code: typeof e.code === "string" && /^[A-Z0-9_]{1,80}$/.test(e.code) ? e.code : "ND_CLIENT_ERROR",
+      message: safeDiagnostic(e.message),
+      ...e.machineId ? { machineId: e.machineId } : {},
+      ...e.jobId ? { jobId: e.jobId } : {},
+      ...e.leaseId ? { leaseId: e.leaseId } : {},
+      operation: typeof e.operation === "string" ? e.operation.replace(/[^a-z-]/g, "").slice(0, 40) : void 0,
+      ...typeof e.observedAt === "string" && Number.isFinite(Date.parse(e.observedAt)) ? { observedAt: new Date(Math.min(Date.now(), Date.parse(e.observedAt))) } : {}
+    };
+  });
+  if (machines.length) await db.collection("machine_inventory").bulkWrite(machines.map((m) => ({ updateOne: { filter: { ownerId: user.id, deviceId, machineId: m.machineId }, update: { $set: m, $unset: { deletedAt: "" } }, upsert: true } })));
+  await db.collection("machine_inventory").updateMany({ ownerId: user.id, deviceId, machineId: { $nin: [...seen] }, deletedAt: { $exists: false } }, { $set: { deletedAt: now } });
+  for (const error of errors) await recordDiagnostic(db, error);
+  return { ok: true, receivedAt: now.toISOString() };
+}
+
 // apps/api/src/app.ts
 function createIdentityServer(store, options) {
   if (options.rateSecret.length < 32)
     throw new Error("AUTH_RATE_SECRET en az 32 karakter olmal\u0131.");
   const directory = options.directory ? new DirectoryService(store.database, options.directory) : void 0;
   const server = import_node_http.default.createServer(async (req, res) => {
+    let actor;
+    const pathname = new URL(req.url ?? "/", "http://identity.local").pathname;
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("X-Frame-Options", "DENY");
@@ -1279,7 +1541,7 @@ function createIdentityServer(store, options) {
           status: "ok",
           service: "nodera-identity",
           version: "0.5.0",
-          capabilities: ["marketplace", "rdp-relay", ...directory ? ["directory-v1", "directory-marketplace-v1", "windows-account-profile-v1"] : []]
+          capabilities: ["marketplace", "rdp-relay", "admin-monitoring-v1", "host-inventory-v1", ...directory ? ["directory-v1", "directory-marketplace-v1", "windows-account-profile-v1"] : []]
         });
         return;
       }
@@ -1297,7 +1559,7 @@ function createIdentityServer(store, options) {
         json(200, await directory.complete(jobId, await readBody(req, 262144)));
         return;
       }
-      if (route === "POST /v1/auth/register" || route === "POST /v1/auth/login") {
+      if (route === "POST /v1/auth/register" || route === "POST /v1/auth/login" || route === "POST /v1/admin/login") {
         let address = req.socket.remoteAddress ?? "unknown";
         if (options.trustProxy) {
           const forwarded = req.headers["x-forwarded-for"];
@@ -1306,7 +1568,7 @@ function createIdentityServer(store, options) {
             throw new HttpError(400, "Proxy adresi do\u011Frulanamad\u0131.");
           address = lastHop;
         }
-        const key = (scope) => (0, import_node_crypto6.createHmac)("sha256", options.rateSecret).update(scope).digest("hex");
+        const key = (scope) => (0, import_node_crypto8.createHmac)("sha256", options.rateSecret).update(scope).digest("hex");
         await store.rateLimit(key(`ip:${address}`), 60);
         const body = await readBody(req);
         if (body.remember !== void 0 && typeof body.remember !== "boolean")
@@ -1318,6 +1580,10 @@ function createIdentityServer(store, options) {
           throw new HttpError(400, error.message);
         }
         await store.rateLimit(key(`email:${email}`), 15);
+        if (route === "POST /v1/admin/login") {
+          json(200, await admin.login(email, password));
+          return;
+        }
         if (route.endsWith("register")) {
           const name = typeof body.name === "string" ? body.name.trim() : "";
           if (name.length < 2 || name.length > 60)
@@ -1330,6 +1596,35 @@ function createIdentityServer(store, options) {
           json(200, await store.login(email, password, body.remember === true));
         return;
       }
+      if (pathname.startsWith("/v1/admin/")) {
+        const token2 = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
+        if (!token2) throw new HttpError(401, "Y\xF6netici giri\u015Fi gerekli.");
+        const user = await admin.userFor(token2);
+        await store.rateLimit("admin-read:" + user.id, 3e3);
+        if (route === "POST /v1/admin/logout") {
+          json(200, await admin.logout(token2));
+          return;
+        }
+        if (req.method !== "GET") throw new HttpError(405, "Bu y\xF6netim i\u015Flemi desteklenmiyor.");
+        if (pathname === "/v1/admin/me") {
+          json(200, { user });
+          return;
+        }
+        if (pathname === "/v1/admin/overview") {
+          json(200, await admin.overview());
+          return;
+        }
+        json(200, await admin.list(pathname.slice("/v1/admin/".length), new URL(req.url, "http://identity.local").searchParams));
+        return;
+      }
+      if (route === "POST /v1/host/inventory") {
+        const token2 = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
+        if (!token2) throw new HttpError(401, "Giri\u015F yap\u0131n.");
+        actor = await store.userFor(token2);
+        await store.rateLimit("inventory:" + actor.id, 120);
+        json(200, await receiveInventory(store.database, actor, await readBody(req, 524288)));
+        return;
+      }
       const marketplaceRoute = /^\/(?:v1\/marketplace|v1\/rentals)(?:\/|$)/.test(
         new URL(req.url ?? "/", "http://identity.local").pathname
       );
@@ -1340,7 +1635,8 @@ function createIdentityServer(store, options) {
       if (!match) throw new HttpError(401, "Devam etmek i\xE7in giri\u015F yap\u0131n.");
       const token = match[1];
       if (directoryRoute) {
-        const user = await store.userFor(token), pathname = new URL(req.url ?? "/", "http://identity.local").pathname;
+        const user = await store.userFor(token), pathname2 = new URL(req.url ?? "/", "http://identity.local").pathname;
+        actor = user;
         if (route === "GET /v1/directory/config") {
           json(200, directory ? { ...directory.config(), agentOnline: await directory.agentOnline() } : { enabled: false });
           return;
@@ -1360,7 +1656,7 @@ function createIdentityServer(store, options) {
           json(200, { machine: await directory.prepare(user, await readBody(req)) });
           return;
         }
-        const machineRoute = pathname.match(/^\/v1\/directory\/machines\/([a-f0-9-]{36})(?:\/(bootstrap|verify|cleanup))?$/);
+        const machineRoute = pathname2.match(/^\/v1\/directory\/machines\/([a-f0-9-]{36})(?:\/(bootstrap|verify|cleanup))?$/);
         if (!machineRoute) throw new HttpError(404, "Domain i\u015Flemi bulunamad\u0131.");
         const [, id, action] = machineRoute;
         if (req.method === "GET" && !action) {
@@ -1383,6 +1679,7 @@ function createIdentityServer(store, options) {
       }
       if (marketplaceRoute) {
         const user = await store.userFor(token);
+        actor = user;
         json(
           200,
           await relay.handle(
@@ -1400,6 +1697,11 @@ function createIdentityServer(store, options) {
         json(200, { ok: true });
       } else json(200, { user: await store.userFor(token) });
     } catch (error) {
+      if (actor && req.method === "POST" && !pathname.startsWith("/v1/host/") && !(error instanceof HttpError && [404, 429].includes(error.status))) {
+        const category = pathname.startsWith("/v1/directory/") ? "directory" : "rental";
+        void recordDiagnostic(store.database, { userId: actor.id, source: "api", category, code: error instanceof HttpError ? `HTTP_${error.status}` : "ND_API_ERROR", message: error instanceof HttpError ? error.message : "Sunucu i\u015Flemi tamamlanamad\u0131.", operation: pathname.split("/").at(-1)?.slice(0, 40) }).catch(() => {
+        });
+      }
       if (error instanceof HttpError) {
         if (error.status === 429) res.setHeader("Retry-After", "600");
         json(error.status, { error: error.message });
@@ -1412,6 +1714,7 @@ function createIdentityServer(store, options) {
     }
   });
   const relay = createRentalRelay(server, store, options.rateSecret, directory);
+  const admin = new AdminService(store, options.adminEmails ?? [], relay.online, !!directory);
   server.requestTimeout = 15e3;
   server.headersTimeout = 1e4;
   server.maxHeadersCount = 40;
@@ -1451,7 +1754,8 @@ async function main() {
   const server = createIdentityServer(store, {
     rateSecret,
     trustProxy: process.env.TRUST_PROXY === "1",
-    directory: directoryOptions()
+    directory: directoryOptions(),
+    adminEmails: adminEmails(process.env.NODERA_ADMIN_EMAILS)
   });
   server.listen(
     port,
