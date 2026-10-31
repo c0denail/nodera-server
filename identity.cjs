@@ -1382,8 +1382,9 @@ var AdminService = class {
     return { user, token, expiresAt: expiresAt.toISOString() };
   }
   async userFor(token) {
-    const session = await this.db.collection("admin_auth_sessions").findOne({ _id: tokenHash(token), expiresAt: { $gt: /* @__PURE__ */ new Date() } });
-    if (!session) throw new HttpError(401, "Y\xF6netici oturumu sona erdi. Yeniden giri\u015F yap.");
+    const session = await this.db.collection("admin_auth_sessions").findOne({ _id: tokenHash(token) });
+    if (!session || !(session.provider === "ad" && session.sessionMode === "application") && (!(session.expiresAt instanceof Date) || session.expiresAt.getTime() <= Date.now()))
+      throw new HttpError(401, "Y\xF6netici oturumu sona erdi. Yeniden giri\u015F yap.");
     if (this.ad) {
       if (session.provider !== "ad" || !this.ad.accepts(session.kid, session.issuer, session.groupSid) || !session.principal) throw new HttpError(403, "Y\xF6netici oturumu ge\xE7erli AD yap\u0131land\u0131rmas\u0131na ait de\u011Fil.");
       const { id, name, email, username, provider } = session.principal;
@@ -1404,9 +1405,9 @@ var AdminService = class {
       if (failure instanceof import_mongodb4.MongoServerError && failure.code === 11e3) throw new HttpError(409, "Bu giri\u015F belgesi kullan\u0131lm\u0131\u015F. Yeniden giri\u015F yap.");
       throw failure;
     }
-    const token = (0, import_node_crypto7.randomBytes)(32).toString("hex"), expiresAt = new Date(Math.min(now.getTime() + 15 * 6e4, verified.proofExpiresAt.getTime() + 10 * 6e4));
-    await this.db.collection("admin_auth_sessions").insertOne({ _id: tokenHash(token), provider: "ad", principal: verified.user, userId: verified.user.id, issuer: this.ad.issuer, groupSid: this.ad.groupSid, kid: verified.kid, createdAt: now, expiresAt });
-    return { user: verified.user, token, expiresAt: expiresAt.toISOString(), expiresInSeconds: Math.max(1, Math.floor((expiresAt.getTime() - Date.now()) / 1e3)) };
+    const token = (0, import_node_crypto7.randomBytes)(32).toString("hex");
+    await this.db.collection("admin_auth_sessions").insertOne({ _id: tokenHash(token), provider: "ad", sessionMode: "application", principal: verified.user, userId: verified.user.id, issuer: this.ad.issuer, groupSid: this.ad.groupSid, kid: verified.kid, createdAt: now });
+    return { user: verified.user, token, sessionMode: "application", expiresAt: null };
   }
   async logout(token) {
     await this.db.collection("admin_auth_sessions").deleteOne({ _id: tokenHash(token) });
@@ -1821,7 +1822,7 @@ var AdminAdVerifier = class {
     }
   }
   config() {
-    return { provider: "ad", issuer: this.issuer, audience: this.audience, groupSid: this.groupSid, keyIds: [...this.keys.keys()], sessionMinutes: 15 };
+    return { provider: "ad", issuer: this.issuer, audience: this.audience, groupSid: this.groupSid, keyIds: [...this.keys.keys()], sessionMode: "application" };
   }
   accepts(kid, issuer, groupSid) {
     return issuer === this.issuer && groupSid === this.groupSid && this.keys.has(kid);
