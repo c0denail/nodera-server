@@ -23,8 +23,8 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 
 // apps/api/src/store.ts
-var import_node_crypto5 = require("node:crypto");
-var import_mongodb3 = require("mongodb");
+var import_node_crypto6 = require("node:crypto");
+var import_mongodb4 = require("mongodb");
 
 // packages/shared/src/errors.ts
 var HttpError = class extends Error {
@@ -41,14 +41,14 @@ var import_node_util = require("node:util");
 var scrypt = (0, import_node_util.promisify)(import_node_crypto.scrypt);
 async function hashPassword(password) {
   const salt = (0, import_node_crypto.randomBytes)(16).toString("hex");
-  const hash = await scrypt(password, salt, 64);
-  return `${salt}:${hash.toString("hex")}`;
+  const hash2 = await scrypt(password, salt, 64);
+  return `${salt}:${hash2.toString("hex")}`;
 }
 async function verifyPassword(password, stored) {
   if (!/^[a-f0-9]{32}:[a-f0-9]{128}$/.test(stored)) return false;
-  const [salt, hash] = stored.split(":");
+  const [salt, hash2] = stored.split(":");
   const actual = await scrypt(password, salt, 64);
-  const expected = Buffer.from(hash, "hex");
+  const expected = Buffer.from(hash2, "hex");
   return actual.length === expected.length && (0, import_node_crypto.timingSafeEqual)(actual, expected);
 }
 var tokenHash = (token) => (0, import_node_crypto.createHash)("sha256").update(token).digest("hex");
@@ -352,8 +352,8 @@ var MarketplaceStore = class {
 };
 
 // apps/api/src/directory.ts
-var import_node_crypto4 = require("node:crypto");
-var import_mongodb2 = require("mongodb");
+var import_node_crypto5 = require("node:crypto");
+var import_mongodb3 = require("mongodb");
 
 // packages/shared/src/directory.ts
 function readWindowsAccountProfile(value) {
@@ -404,6 +404,189 @@ async function recordDiagnostic(db, event) {
   } }, { upsert: true });
 }
 
+// apps/api/src/installations.ts
+var import_node_crypto4 = require("node:crypto");
+var import_mongodb2 = require("mongodb");
+var liveStates = ["pending", "approved", "running"];
+var states = [...liveStates, "succeeded", "failed", "rejected", "cancelled", "expired"];
+var sid = /^S-1-5-21-\d+-\d+-\d+-\d+$/;
+var hash = /^[a-f0-9]{64}$/;
+async function initializeInstallations(db) {
+  await db.collection("installation_requests").createIndex({ status: 1, createdAt: -1 });
+  await db.collection("installation_requests").createIndex({ machineId: 1, generation: 1, leaseId: 1 });
+  await db.collection("installation_requests").createIndex({ deleteAfter: 1 }, { expireAfterSeconds: 0 });
+  await db.collection("directory_machines").createIndex({ installAgentHash: 1 }, { sparse: true, unique: true });
+}
+async function installationBootstrap(db, machine, key) {
+  const token = (0, import_node_crypto4.createHmac)("sha256", Buffer.from(key, "hex")).update(`install-agent-v1:${machine.ownerId}:${machine.machineId}:${machine.generation}`).digest("hex");
+  await db.collection("directory_machines").updateOne({ _id: machine.machineId, ownerId: machine.ownerId, generation: machine.generation }, { $set: { installAgentHash: tokenHash(token), installAgentGeneration: machine.generation } });
+  return { token, machineId: machine.machineId, generation: machine.generation };
+}
+function text(value, max, required = false, multiline = false) {
+  if (typeof value !== "string" || value.length > max || (multiline ? /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/ : /[\x00-\x1f\x7f]/).test(value) || required && !value.trim()) throw new HttpError(400, "Kurulum bilgileri ge\xE7ersiz.");
+  return value.trim();
+}
+var InstallationService = class {
+  constructor(db) {
+    this.db = db;
+  }
+  db;
+  get requests() {
+    return this.db.collection("installation_requests");
+  }
+  async authenticate(token) {
+    if (!hash.test(token)) throw new HttpError(401, "VM kurulum arac\u0131s\u0131 do\u011Frulanamad\u0131.");
+    const machine = await this.db.collection("directory_machines").findOne({ installAgentHash: tokenHash(token), phase: "ready", $expr: { $eq: ["$installAgentGeneration", "$generation"] } });
+    if (!machine) throw new HttpError(401, "VM kurulum arac\u0131s\u0131n\u0131n kimli\u011Fi art\u0131k ge\xE7erli de\u011Fil.");
+    await this.db.collection("directory_machines").updateOne({ _id: machine._id, generation: machine.generation }, { $set: { installAgentSeenAt: /* @__PURE__ */ new Date() } });
+    return machine;
+  }
+  async lease(machine) {
+    const listing = await this.db.collection("rental_listings").findOne({ machineId: machine.machineId, ownerId: machine.ownerId, directoryGeneration: machine.generation, resetRequired: false, "lease.phase": "active", "lease.expiresAt": { $gt: /* @__PURE__ */ new Date() } });
+    if (!listing?.lease) throw new HttpError(409, "Bu VM'de aktif kiralama yok.");
+    const account = await this.db.collection("directory_accounts").findOne({ _id: listing.lease.guestId, state: "ready" });
+    if (!account || !sid.test(account.sid)) throw new HttpError(409, "Kirac\u0131n\u0131n Windows hesab\u0131 haz\u0131r de\u011Fil.");
+    return { listing, account };
+  }
+  async context(machine) {
+    try {
+      const { listing, account } = await this.lease(machine);
+      return { active: true, machineId: machine.machineId, generation: machine.generation, leaseId: listing.lease.id, windowsSid: account.sid, windowsUsername: `${account.domain}\\${account.username}`, expiresAt: listing.lease.expiresAt.toISOString(), serverNow: (/* @__PURE__ */ new Date()).toISOString() };
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 409) return { active: false, serverNow: (/* @__PURE__ */ new Date()).toISOString() };
+      throw e;
+    }
+  }
+  async valid(request) {
+    if (request.expiresAt <= /* @__PURE__ */ new Date() || request.status === "approved" && request.approvalExpiresAt <= /* @__PURE__ */ new Date()) throw new HttpError(409, "Kurulum talebinin s\xFCresi doldu.");
+    const machine = await this.db.collection("directory_machines").findOne({ _id: request.machineId, generation: request.generation, ownerId: request.ownerId, phase: "ready" });
+    if (!machine) throw new HttpError(409, "VM'nin \xE7al\u0131\u015Fma ortam\u0131 de\u011Fi\u015Fti.");
+    const current = await this.lease(machine);
+    if (current.listing.lease.id !== request.leaseId || current.listing.lease.guestId !== request.userId || current.account.sid !== request.windowsSid) throw new HttpError(409, "Kiralama veya Windows hesab\u0131 de\u011Fi\u015Fti.");
+    return current;
+  }
+  async invalidate(request) {
+    if (!liveStates.includes(request.status)) return request;
+    try {
+      await this.valid(request);
+    } catch (e) {
+      if (!(e instanceof HttpError)) throw e;
+      const status = request.expiresAt <= /* @__PURE__ */ new Date() || request.status === "approved" && request.approvalExpiresAt <= /* @__PURE__ */ new Date() ? "expired" : "cancelled";
+      await this.requests.updateOne({ _id: request._id, status: { $in: liveStates } }, { $set: { status, completedAt: /* @__PURE__ */ new Date(), resultCode: status === "expired" ? "REQUEST_EXPIRED" : "LEASE_CHANGED" } });
+      request.status = status;
+    }
+    return request;
+  }
+  dto(r) {
+    const { _id: id, machineId, generation, computerName, machineName, leaseId, userId, userName, userEmail, windowsUsername: windowsUsername2, fileName, productName, version, publisher, signatureStatus, sha256, size, status, mode, reason, decidedBy, createdAt, decidedAt, expiresAt, completedAt, resultCode, exitCode, rebootRequired } = r;
+    return { id, machineId, generation, computerName, machineName, leaseId, userId, userName, userEmail, windowsUsername: windowsUsername2, fileName, productName, version, publisher, signatureStatus, sha256, size, status, mode, reason, decidedBy, createdAt, decidedAt, expiresAt, completedAt, resultCode, exitCode, rebootRequired };
+  }
+  async submit(machine, body) {
+    const { listing, account } = await this.lease(machine);
+    if (typeof body.id !== "string" || !uuid.test(body.id) || body.windowsSid !== account.sid || typeof body.sha256 !== "string" || !hash.test(body.sha256) || !Number.isSafeInteger(body.size) || Number(body.size) < 1 || Number(body.size) > 2 * 1024 ** 3 || !["valid", "unsigned", "untrusted"].includes(String(body.signatureStatus))) throw new HttpError(400, "Dosya veya Windows oturum bilgileri ge\xE7ersiz.");
+    const fileName = text(body.fileName, 240, true);
+    if (!/\.(exe|msi)$/i.test(fileName) || /[\\/:*?"<>|]/.test(fileName)) throw new HttpError(400, "Yaln\u0131zca EXE ve MSI kurulum dosyalar\u0131 kabul edilir.");
+    const user = await this.db.collection("users").findOne({ _id: listing.lease.guestId });
+    if (!user) throw new HttpError(409, "Kirac\u0131 hesab\u0131 bulunamad\u0131.");
+    const existing = await this.requests.findOne({ _id: body.id });
+    if (existing) {
+      if (existing.machineId !== machine.machineId || existing.generation !== machine.generation || existing.leaseId !== listing.lease.id || existing.sha256 !== body.sha256 || existing.windowsSid !== account.sid) throw new HttpError(409, "Talep kimli\u011Fi ba\u015Fka bir dosyaya veya kiralamaya ait.");
+      return { request: this.dto(await this.invalidate(existing)) };
+    }
+    if (await this.requests.countDocuments({ machineId: machine.machineId, status: { $in: liveStates }, expiresAt: { $gt: /* @__PURE__ */ new Date() } }) >= 10) throw new HttpError(429, "Bu VM i\xE7in en fazla 10 bekleyen kurulum olabilir.");
+    const now = /* @__PURE__ */ new Date(), request = {
+      _id: body.id,
+      machineId: machine.machineId,
+      ownerId: machine.ownerId,
+      generation: machine.generation,
+      computerName: machine.computerName,
+      machineName: listing.name,
+      leaseId: listing.lease.id,
+      userId: user.id,
+      userName: user.name,
+      userEmail: user.email,
+      windowsSid: account.sid,
+      windowsUsername: `${account.domain}\\${account.username}`,
+      fileName,
+      sha256: body.sha256,
+      size: body.size,
+      productName: text(body.productName, 200),
+      version: text(body.version, 100),
+      publisher: text(body.publisher, 300),
+      signatureStatus: body.signatureStatus,
+      status: "pending",
+      createdAt: now,
+      expiresAt: new Date(Math.min(now.getTime() + 30 * 6e4, listing.lease.expiresAt.getTime())),
+      deleteAfter: new Date(now.getTime() + 90 * 864e5)
+    };
+    try {
+      await this.requests.insertOne(request);
+    } catch (e) {
+      if (e instanceof import_mongodb2.MongoServerError && e.code === 11e3) return this.submit(machine, body);
+      throw e;
+    }
+    return { request: this.dto(request) };
+  }
+  async list(query) {
+    const page = Number(query.get("page") ?? 1), pageSize = Number(query.get("pageSize") ?? 25), q = (query.get("q") ?? "").trim(), status = query.get("status") ?? "";
+    if (!Number.isSafeInteger(page) || page < 1 || page > 1e4 || ![10, 25, 50].includes(pageSize) || q.length > 100 || status && !states.includes(status)) throw new HttpError(400, "Kurulum filtresi ge\xE7ersiz.");
+    for (const r of await this.requests.find({ status: { $in: liveStates } }).limit(500).toArray()) await this.invalidate(r);
+    const filter = status ? { status } : {};
+    if (q) filter.$or = ["fileName", "productName", "userName", "userEmail", "windowsUsername", "computerName", "machineName", "sha256"].map((key) => ({ [key]: { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" } }));
+    const [items, total, pendingCount] = await Promise.all([this.requests.find(filter).sort({ createdAt: -1, _id: 1 }).skip((page - 1) * pageSize).limit(pageSize).toArray(), this.requests.countDocuments(filter), this.requests.countDocuments({ status: "pending", expiresAt: { $gt: /* @__PURE__ */ new Date() } })]);
+    return { items: items.map((r) => this.dto(r)), total, page, pageSize, pendingCount, serverNow: (/* @__PURE__ */ new Date()).toISOString() };
+  }
+  async decide(id, admin, body) {
+    if (!uuid.test(id) || !["approve", "reject"].includes(String(body.decision))) throw new HttpError(400, "Kurulum karar\u0131 ge\xE7ersiz.");
+    const request = await this.requests.findOne({ _id: id });
+    if (!request) throw new HttpError(404, "Kurulum talebi bulunamad\u0131.");
+    await this.valid(request);
+    if (request.sha256 !== body.sha256) throw new HttpError(409, "Ekrandaki dosya kimli\u011Fi taleple uyu\u015Fmuyor. Listeyi yenile.");
+    const reason = text(body.reason ?? "", 500, false, true), approve = body.decision === "approve", mode = String(body.mode ?? "interactive");
+    if (approve && (!["interactive", "msi", "inno", "nsis"].includes(mode) || mode === "msi" && !/\.msi$/i.test(request.fileName) || /\.msi$/i.test(request.fileName) && !["msi", "interactive"].includes(mode))) throw new HttpError(400, "Kurucu t\xFCr\xFC dosyayla uyu\u015Fmuyor.");
+    const result = await this.requests.findOneAndUpdate({ _id: id, status: "pending", expiresAt: { $gt: /* @__PURE__ */ new Date() } }, { $set: { status: approve ? "approved" : "rejected", mode, reason, decidedBy: { id: admin.id, name: admin.name }, decidedAt: /* @__PURE__ */ new Date(), ...approve ? { approvalExpiresAt: new Date(Math.min(Date.now() + 10 * 6e4, request.expiresAt.getTime())) } : { completedAt: /* @__PURE__ */ new Date() } } }, { returnDocument: "after" });
+    if (!result) throw new HttpError(409, "Bu talep daha \xF6nce karara ba\u011Fland\u0131 veya s\xFCresi doldu.");
+    return { request: this.dto(result) };
+  }
+  async owned(machine, id) {
+    if (!uuid.test(id)) throw new HttpError(400, "Talep kimli\u011Fi ge\xE7ersiz.");
+    const request = await this.requests.findOne({ _id: id, machineId: machine.machineId, generation: machine.generation, ownerId: machine.ownerId });
+    if (!request) throw new HttpError(404, "Kurulum talebi bulunamad\u0131.");
+    return this.invalidate(request);
+  }
+  async state(machine, id) {
+    return { request: this.dto(await this.owned(machine, id)) };
+  }
+  async cancel(machine, id, windowsSid) {
+    const r = await this.owned(machine, id);
+    if (r.windowsSid !== windowsSid) throw new HttpError(403, "Bu talep ba\u015Fka bir Windows hesab\u0131na ait.");
+    await this.requests.updateOne({ _id: r._id, status: { $in: liveStates } }, { $set: { status: "cancelled", resultCode: "USER_CANCELLED", completedAt: /* @__PURE__ */ new Date() } });
+    return { ok: true };
+  }
+  async claim(machine, id) {
+    const request = await this.owned(machine, id);
+    await this.valid(request);
+    const claim = (0, import_node_crypto4.randomBytes)(32).toString("hex");
+    const saved = await this.requests.findOneAndUpdate({ _id: id, status: "approved", approvalExpiresAt: { $gt: /* @__PURE__ */ new Date() }, expiresAt: { $gt: /* @__PURE__ */ new Date() } }, { $set: { status: "running", claimHash: tokenHash(claim), startedAt: /* @__PURE__ */ new Date() } }, { returnDocument: "after" });
+    if (!saved) throw new HttpError(409, "Kurulum onay\u0131 kullan\u0131lm\u0131\u015F veya s\xFCresi dolmu\u015F.");
+    return { request: this.dto(saved), claim, serverNow: (/* @__PURE__ */ new Date()).toISOString() };
+  }
+  async running(machine, id, claim) {
+    const r = await this.owned(machine, id);
+    await this.valid(r);
+    if (typeof claim !== "string" || !hash.test(claim) || r.claimHash !== tokenHash(claim) || r.status !== "running") throw new HttpError(409, "Kurulum y\xFCr\xFCtme yetkisi ge\xE7ersiz.");
+    return r;
+  }
+  async finish(machine, id, body) {
+    const r = await this.running(machine, id, body.claim);
+    if (!Number.isSafeInteger(body.exitCode) || !["INSTALL_EXIT", "INSTALL_CANCELLED", "INSTALL_RESTART", "INSTALL_ERROR"].includes(String(body.resultCode))) throw new HttpError(400, "Kurulum sonucu ge\xE7ersiz.");
+    const success = body.resultCode === "INSTALL_EXIT" && [0, 3010, 1641].includes(Number(body.exitCode));
+    await this.requests.updateOne({ _id: r._id, status: "running", claimHash: r.claimHash }, { $set: { status: success ? "succeeded" : "failed", resultCode: body.resultCode, exitCode: body.exitCode, rebootRequired: success && body.exitCode !== 0, completedAt: /* @__PURE__ */ new Date() } });
+    if (!success) await recordDiagnostic(this.db, { id: r._id, userId: r.userId, machineId: r.machineId, leaseId: r.leaseId, source: "api", category: "installation", operation: "application-install", code: "ND_APP_" + body.resultCode, message: "Onaylanan uygulama kurulumu tamamlanamad\u0131. Kurulum talepleri ekran\u0131ndan sonu\xE7 kodunu inceleyin." });
+    return { ok: true };
+  }
+};
+
 // apps/api/src/directory.ts
 function directoryOptions(env = process.env) {
   if (env.NODERA_DIRECTORY_ENABLED !== "true") return;
@@ -450,15 +633,15 @@ var DirectoryService = class {
     return agent?.seenAt instanceof Date && agent.seenAt.getTime() > Date.now() - 12e4;
   }
   seal(value) {
-    const iv = (0, import_node_crypto4.randomBytes)(12), cipher = (0, import_node_crypto4.createCipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), iv);
+    const iv = (0, import_node_crypto5.randomBytes)(12), cipher = (0, import_node_crypto5.createCipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), iv);
     return Buffer.concat([iv, cipher.update(JSON.stringify(value)), cipher.final(), cipher.getAuthTag()]).toString("base64");
   }
   open(value) {
-    const data = Buffer.from(value, "base64"), decipher = (0, import_node_crypto4.createDecipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), data.subarray(0, 12));
+    const data = Buffer.from(value, "base64"), decipher = (0, import_node_crypto5.createDecipheriv)("aes-256-gcm", Buffer.from(this.options.dataKey, "hex"), data.subarray(0, 12));
     decipher.setAuthTag(data.subarray(-16));
     return JSON.parse(Buffer.concat([decipher.update(data.subarray(12, -16)), decipher.final()]).toString("utf8"));
   }
-  async enqueue(kind, ownerId, payload, machine, id = (0, import_node_crypto4.randomUUID)()) {
+  async enqueue(kind, ownerId, payload, machine, id = (0, import_node_crypto5.randomUUID)()) {
     const job = { _id: id, kind, ownerId, ...machine ? { machineId: machine.machineId, generation: machine.generation } : {}, encrypted: this.seal(payload), status: "queued", createdAt: /* @__PURE__ */ new Date(), expiresAt: new Date(Date.now() + 30 * 6e4) };
     await this.jobs.insertOne(job);
     return id;
@@ -514,7 +697,7 @@ var DirectoryService = class {
     }
     if (!existing && (password === void 0 || !profile)) throw new HttpError(400, "Yeni Windows hesab\u0131 i\xE7in ad, soyad, e-posta ve parola gerekli.");
     if (existing && password === void 0 && body.profile === void 0) throw new HttpError(400, "G\xFCncellenecek Windows hesab\u0131 bilgilerini gir.");
-    const jobId = (0, import_node_crypto4.randomUUID)();
+    const jobId = (0, import_node_crypto5.randomUUID)();
     try {
       if (existing) {
         const saved = await this.accounts.updateOne({ _id: user.id, jobId: existing.jobId, state: { $ne: "pending" } }, { $set: { state: "pending", jobId, changedAt: /* @__PURE__ */ new Date(), ...profile ? { profile } : {} }, $unset: { error: "" } });
@@ -522,7 +705,7 @@ var DirectoryService = class {
       } else await this.accounts.insertOne({ _id: user.id, username, domain: this.options.netbios, state: "pending", jobId, changedAt: /* @__PURE__ */ new Date(), profile });
     } catch (error) {
       await this.jobs.deleteOne({ _id: jobId, status: "queued" });
-      if (error instanceof import_mongodb2.MongoServerError && error.code === 11e3) throw new HttpError(409, "Bu Windows kullan\u0131c\u0131 ad\u0131 kullan\u0131l\u0131yor veya ba\u015Fka bir hesap i\u015Flemi devam ediyor.");
+      if (error instanceof import_mongodb3.MongoServerError && error.code === 11e3) throw new HttpError(409, "Bu Windows kullan\u0131c\u0131 ad\u0131 kullan\u0131l\u0131yor veya ba\u015Fka bir hesap i\u015Flemi devam ediyor.");
       throw error;
     }
     try {
@@ -543,7 +726,7 @@ var DirectoryService = class {
       if (current.phase === "cleaning" || current.phase === "failed") throw new HttpError(409, "\xD6nce \xF6nceki AD/VPN haz\u0131rl\u0131\u011F\u0131n\u0131 temizleyin.");
       return this.publicMachine(current);
     }
-    const generation = (0, import_node_crypto4.randomUUID)(), jobId = (0, import_node_crypto4.randomUUID)();
+    const generation = (0, import_node_crypto5.randomUUID)(), jobId = (0, import_node_crypto5.randomUUID)();
     const doc = { _id: machineId, machineId, deviceId, ownerId: user.id, generation, computerName: "ND-" + generation.replaceAll("-", "").slice(0, 12).toUpperCase(), phase: "preparing", jobId, changedAt: /* @__PURE__ */ new Date() };
     await this.machines.insertOne(doc);
     await this.enqueue("provision", user.id, { ...this.publicMachine(doc), ownerId: user.id }, doc, jobId);
@@ -552,23 +735,29 @@ var DirectoryService = class {
   async bootstrap(user, id) {
     const machine = await this.owned(user.id, id), job = await this.jobs.findOne({ _id: machine.jobId, status: "done", expiresAt: { $gt: /* @__PURE__ */ new Date() } });
     if (machine.phase !== "joining" || !job?.result || job.kind !== "provision") throw new HttpError(409, "VM kat\u0131l\u0131m bilgisi hen\xFCz haz\u0131r de\u011Fil veya s\xFCresi doldu.");
-    return { ...this.publicMachine(machine), ...this.open(job.result), config: this.config() };
+    return { ...this.publicMachine(machine), ...this.open(job.result), config: this.config(), installAgent: await installationBootstrap(this.db, machine, this.options.dataKey) };
   }
   async verify(user, id, body) {
     const machine = await this.owned(user.id, id);
     if (body.generation !== machine.generation || body.computerName !== machine.computerName || body.domain !== this.options.domain || body.secureChannel !== true || body.nla !== true) throw new HttpError(409, "VM'nin domain ve ba\u011Flant\u0131 kan\u0131t\u0131 uyu\u015Fmuyor.");
     if (machine.phase === "ready" || machine.phase === "verifying") return this.publicMachine(machine);
     if (machine.phase !== "joining") throw new HttpError(409, "VM domain kat\u0131l\u0131m\u0131 i\xE7in haz\u0131r de\u011Fil.");
-    const jobId = (0, import_node_crypto4.randomUUID)();
+    const jobId = (0, import_node_crypto5.randomUUID)();
     const changed = await this.machines.updateOne({ _id: id, generation: machine.generation, phase: "joining" }, { $set: { phase: "verifying", jobId, changedAt: /* @__PURE__ */ new Date() } });
     if (changed.modifiedCount) await this.enqueue("verify", user.id, { ...this.publicMachine(machine), ownerId: user.id, computerGuid: machine.computerGuid }, machine, jobId);
     return this.publicMachine(await this.owned(user.id, id));
+  }
+  async installationConfig(user, id) {
+    const machine = await this.owned(user.id, id);
+    if (machine.phase !== "ready") throw new HttpError(409, "\xD6nce VM'nin AD haz\u0131rl\u0131\u011F\u0131n\u0131 tamamla.");
+    if (await this.db.collection("rental_listings").findOne({ machineId: id, ownerId: user.id, $or: [{ published: true }, { "lease.phase": { $in: ["active", "reserved", "resetting"] } }] })) throw new HttpError(409, "Kurulum arac\u0131s\u0131n\u0131 g\xFCncellemeden \xF6nce VM'yi kiralamaya kapat ve mevcut kiralaman\u0131n temizlenmesini bekle.");
+    return { ...this.publicMachine(machine), installAgent: await installationBootstrap(this.db, machine, this.options.dataKey) };
   }
   async cleanup(userId, id) {
     if (await this.db.collection("rental_listings").findOne({ ownerId: userId, machineId: id, resetRequired: false, "lease.phase": { $in: ["reserved", "active"] } }, { projection: { _id: 1 } })) throw new HttpError(409, "Aktif kiralama bitmeden makinenin AD/VPN kimli\u011Fi temizlenemez.");
     const machine = await this.owned(userId, id);
     if (machine.phase === "cleaning") return this.publicMachine(machine);
-    const jobId = (0, import_node_crypto4.randomUUID)();
+    const jobId = (0, import_node_crypto5.randomUUID)();
     const saved = await this.machines.updateOne({ _id: id, generation: machine.generation, jobId: machine.jobId }, { $set: { phase: "cleaning", jobId, changedAt: /* @__PURE__ */ new Date() } });
     if (saved.modifiedCount) await this.enqueue("cleanup", userId, { ...this.publicMachine(machine), ownerId: userId, computerGuid: machine.computerGuid, deviceNodeId: machine.deviceNodeId }, machine, jobId);
     return this.publicMachine(await this.owned(userId, id));
@@ -590,11 +779,11 @@ var DirectoryService = class {
     return job.status === "done";
   }
   authenticate(token) {
-    return (0, import_node_crypto4.timingSafeEqual)((0, import_node_crypto4.createHash)("sha256").update(token).digest(), (0, import_node_crypto4.createHash)("sha256").update(this.options.agentToken).digest());
+    return (0, import_node_crypto5.timingSafeEqual)((0, import_node_crypto5.createHash)("sha256").update(token).digest(), (0, import_node_crypto5.createHash)("sha256").update(this.options.agentToken).digest());
   }
   async claim() {
     await this.db.collection("directory_agent").updateOne({ name: "dc1" }, { $set: { seenAt: /* @__PURE__ */ new Date() } }, { upsert: true });
-    const claim = (0, import_node_crypto4.randomBytes)(32).toString("hex"), now = /* @__PURE__ */ new Date();
+    const claim = (0, import_node_crypto5.randomBytes)(32).toString("hex"), now = /* @__PURE__ */ new Date();
     const job = await this.jobs.findOneAndUpdate({ expiresAt: { $gt: now }, $or: [{ status: "queued" }, { status: "running", claimUntil: { $lt: now } }] }, { $set: { status: "running", claim, claimUntil: new Date(Date.now() + 18e4) } }, { sort: { createdAt: 1 }, returnDocument: "after" });
     if (!job) return null;
     const current = job.kind === "account" ? await this.accounts.findOne({ _id: job.ownerId, jobId: job._id }) : job.machineId ? await this.machines.findOne({ _id: job.machineId, generation: job.generation, ...job.kind === "grant" ? { phase: "ready" } : { jobId: job._id } }) : null;
@@ -683,6 +872,7 @@ var AccountStore = class {
     await initializeMarketplace(this.db);
     await initializeDirectory(this.db);
     await initializeObservability(this.db);
+    await initializeInstallations(this.db);
     await this.accounts.createIndex(
       { email: 1 },
       { unique: true, name: "unique_email" }
@@ -716,7 +906,7 @@ var AccountStore = class {
         returnDocument: "after"
       });
     } catch (error) {
-      if (!(error instanceof import_mongodb3.MongoServerError) || error.code !== 11e3)
+      if (!(error instanceof import_mongodb4.MongoServerError) || error.code !== 11e3)
         throw error;
       result = await this.attempts.findOneAndUpdate({ _id: id }, update, {
         returnDocument: "after"
@@ -729,7 +919,7 @@ var AccountStore = class {
       );
   }
   async register(name, email, password, remember = false) {
-    const id = (0, import_node_crypto5.randomUUID)();
+    const id = (0, import_node_crypto6.randomUUID)();
     const account = {
       _id: id,
       id,
@@ -741,7 +931,7 @@ var AccountStore = class {
     try {
       await this.accounts.insertOne(account);
     } catch (error) {
-      if (error instanceof import_mongodb3.MongoServerError && error.code === 11e3)
+      if (error instanceof import_mongodb4.MongoServerError && error.code === 11e3)
         throw new HttpError(409, "Bu e-posta ile zaten bir hesap var.");
       throw error;
     }
@@ -762,7 +952,7 @@ var AccountStore = class {
     return publicUser(account);
   }
   async issueSession(account, remember) {
-    const token = (0, import_node_crypto5.randomBytes)(32).toString("hex");
+    const token = (0, import_node_crypto6.randomBytes)(32).toString("hex");
     const expiresAt = new Date(Date.now() + (remember ? 30 : 1) * 864e5);
     await this.sessions.insertOne({
       _id: tokenHash(token),
@@ -797,7 +987,7 @@ async function connectAccounts(uri, databaseName) {
     throw new IdentityStartupError("CONFIG_URI");
   if (!/^[a-zA-Z0-9_-]{1,63}$/.test(databaseName))
     throw new IdentityStartupError("CONFIG_DATABASE");
-  const client = new import_mongodb3.MongoClient(uri, {
+  const client = new import_mongodb4.MongoClient(uri, {
     appName: "Nodera Identity",
     maxPoolSize: 10,
     serverSelectionTimeoutMS: 5e3,
@@ -818,12 +1008,12 @@ async function connectAccounts(uri, databaseName) {
 
 // apps/api/src/app.ts
 var import_node_http = __toESM(require("node:http"), 1);
-var import_node_crypto8 = require("node:crypto");
+var import_node_crypto9 = require("node:crypto");
 var import_node_net = require("node:net");
 
 // apps/api/src/relay.ts
 var import_ws = require("ws");
-var import_node_crypto6 = require("node:crypto");
+var import_node_crypto7 = require("node:crypto");
 
 // packages/shared/src/marketplace-filters.ts
 var marketResources = ["cpu", "memory", "storage"];
@@ -1220,7 +1410,7 @@ function createRentalRelay(server, accounts, rateSecret, directory) {
       );
       if (method === "POST" && action) {
         await accounts.rateLimit(
-          (0, import_node_crypto6.createHmac)("sha256", rateSecret).update(`rental:${user.id}`).digest("hex"),
+          (0, import_node_crypto7.createHmac)("sha256", rateSecret).update(`rental:${user.id}`).digest("hex"),
           60
         );
         const item = await market.listings.findOne({ _id: action[1] });
@@ -1308,8 +1498,8 @@ function createRentalRelay(server, accounts, rateSecret, directory) {
 }
 
 // apps/api/src/admin.ts
-var import_node_crypto7 = require("node:crypto");
-var import_mongodb4 = require("mongodb");
+var import_node_crypto8 = require("node:crypto");
+var import_mongodb5 = require("mongodb");
 function adminEmails(value = "") {
   const emails = value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   if (emails.some((x) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x) || x.length > 254) || emails.length > 20)
@@ -1377,7 +1567,7 @@ var AdminService = class {
     if (this.ad) throw new HttpError(403, "Y\xF6netici eri\u015Fimi Windows hesab\u0131yla yap\u0131l\u0131r. G\xFCncel Nodera Y\xF6netim uygulamas\u0131n\u0131 kullan.");
     const user = await this.store.verifyCredentials(email, password);
     if (!this.emails.includes(user.email)) throw new HttpError(403, "Bu hesab\u0131n y\xF6netici eri\u015Fimi yok. Sunucudaki y\xF6netici listesine eklenmesi gerekiyor.");
-    const token = (0, import_node_crypto7.randomBytes)(32).toString("hex"), expiresAt = new Date(Date.now() + 8 * 36e5);
+    const token = (0, import_node_crypto8.randomBytes)(32).toString("hex"), expiresAt = new Date(Date.now() + 8 * 36e5);
     await this.db.collection("admin_auth_sessions").insertOne({ _id: tokenHash(token), userId: user.id, expiresAt });
     return { user, token, expiresAt: expiresAt.toISOString() };
   }
@@ -1402,10 +1592,10 @@ var AdminService = class {
     try {
       await this.db.collection("admin_ad_proofs").insertOne({ _id: tokenHash(this.ad.issuer + ":" + verified.jti), expiresAt: new Date(verified.proofExpiresAt.getTime() + 6e4) });
     } catch (failure) {
-      if (failure instanceof import_mongodb4.MongoServerError && failure.code === 11e3) throw new HttpError(409, "Bu giri\u015F belgesi kullan\u0131lm\u0131\u015F. Yeniden giri\u015F yap.");
+      if (failure instanceof import_mongodb5.MongoServerError && failure.code === 11e3) throw new HttpError(409, "Bu giri\u015F belgesi kullan\u0131lm\u0131\u015F. Yeniden giri\u015F yap.");
       throw failure;
     }
-    const token = (0, import_node_crypto7.randomBytes)(32).toString("hex");
+    const token = (0, import_node_crypto8.randomBytes)(32).toString("hex");
     await this.db.collection("admin_auth_sessions").insertOne({ _id: tokenHash(token), provider: "ad", sessionMode: "application", principal: verified.user, userId: verified.user.id, issuer: this.ad.issuer, groupSid: this.ad.groupSid, kid: verified.kid, createdAt: now });
     return { user: verified.user, token, sessionMode: "application", expiresAt: null };
   }
@@ -1568,7 +1758,7 @@ function createIdentityServer(store, options) {
           status: "ok",
           service: "nodera-identity",
           version: "0.5.0",
-          capabilities: ["marketplace", "rdp-relay", "admin-monitoring-v1", "host-inventory-v1", ...options.adminAd ? ["admin-ad-auth-v1"] : [], ...directory ? ["directory-v1", "directory-marketplace-v1", "windows-account-profile-v1"] : []]
+          capabilities: ["marketplace", "rdp-relay", "admin-monitoring-v1", "host-inventory-v1", "installation-approval-v1", ...options.adminAd ? ["admin-ad-auth-v1"] : [], ...directory ? ["directory-v1", "directory-marketplace-v1", "windows-account-profile-v1"] : []]
         });
         return;
       }
@@ -1576,6 +1766,41 @@ function createIdentityServer(store, options) {
         throw new HttpError(403, "Bu kayna\u011Fa izin verilmiyor.");
       if (route === "GET /v1/admin/auth-config") {
         json(200, options.adminAd?.config() ?? { provider: "membership" });
+        return;
+      }
+      if (pathname.startsWith("/v1/install-agent/")) {
+        const token2 = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1] ?? "";
+        const machine = await installations.authenticate(token2);
+        await store.rateLimit("install-agent:" + machine.machineId, 3600);
+        if (route === "POST /v1/install-agent/context") {
+          json(200, await installations.context(machine));
+          return;
+        }
+        if (route === "POST /v1/install-agent/requests") {
+          json(200, await installations.submit(machine, await readBody(req)));
+          return;
+        }
+        const request = pathname.match(/^\/v1\/install-agent\/requests\/([a-f0-9-]{36})\/(state|claim|continue|finish|cancel)$/);
+        if (req.method !== "POST" || !request) throw new HttpError(404, "Kurulum arac\u0131 i\u015Flemi bulunamad\u0131.");
+        const [, id, action] = request, body = await readBody(req);
+        if (action === "state") {
+          json(200, await installations.state(machine, id));
+          return;
+        }
+        if (action === "claim") {
+          json(200, await installations.claim(machine, id));
+          return;
+        }
+        if (action === "cancel") {
+          json(200, await installations.cancel(machine, id, body.windowsSid));
+          return;
+        }
+        if (action === "continue") {
+          const r = await installations.running(machine, id, body.claim);
+          json(200, { ok: true, expiresAt: r.expiresAt.toISOString(), serverNow: (/* @__PURE__ */ new Date()).toISOString() });
+          return;
+        }
+        json(200, await installations.finish(machine, id, body));
         return;
       }
       if (route.startsWith("POST /v1/ad-agent/")) {
@@ -1599,7 +1824,7 @@ function createIdentityServer(store, options) {
             throw new HttpError(400, "Proxy adresi do\u011Frulanamad\u0131.");
           address = lastHop;
         }
-        const key = (scope) => (0, import_node_crypto8.createHmac)("sha256", options.rateSecret).update(scope).digest("hex");
+        const key = (scope) => (0, import_node_crypto9.createHmac)("sha256", options.rateSecret).update(scope).digest("hex");
         await store.rateLimit(key(`ip:${address}`), 60);
         const body = await readBody(req);
         if (route === "POST /v1/admin/ad-login") {
@@ -1641,7 +1866,16 @@ function createIdentityServer(store, options) {
           json(200, await admin.logout(token2));
           return;
         }
+        const decision = pathname.match(/^\/v1\/admin\/installations\/([a-f0-9-]{36})\/decision$/);
+        if (req.method === "POST" && decision) {
+          json(200, await installations.decide(decision[1], user, await readBody(req)));
+          return;
+        }
         if (req.method !== "GET") throw new HttpError(405, "Bu y\xF6netim i\u015Flemi desteklenmiyor.");
+        if (pathname === "/v1/admin/installations") {
+          json(200, await installations.list(new URL(req.url, "http://identity.local").searchParams));
+          return;
+        }
         if (pathname === "/v1/admin/me") {
           json(200, { user });
           return;
@@ -1692,7 +1926,7 @@ function createIdentityServer(store, options) {
           json(200, { machine: await directory.prepare(user, await readBody(req)) });
           return;
         }
-        const machineRoute = pathname2.match(/^\/v1\/directory\/machines\/([a-f0-9-]{36})(?:\/(bootstrap|verify|cleanup))?$/);
+        const machineRoute = pathname2.match(/^\/v1\/directory\/machines\/([a-f0-9-]{36})(?:\/(bootstrap|verify|cleanup|install-agent))?$/);
         if (!machineRoute) throw new HttpError(404, "Domain i\u015Flemi bulunamad\u0131.");
         const [, id, action] = machineRoute;
         if (req.method === "GET" && !action) {
@@ -1701,6 +1935,10 @@ function createIdentityServer(store, options) {
         }
         if (req.method === "GET" && action === "bootstrap") {
           json(200, await directory.bootstrap(user, id));
+          return;
+        }
+        if (req.method === "GET" && action === "install-agent") {
+          json(200, await directory.installationConfig(user, id));
           return;
         }
         if (req.method === "POST" && action === "verify") {
@@ -1750,6 +1988,7 @@ function createIdentityServer(store, options) {
     }
   });
   const relay = createRentalRelay(server, store, options.rateSecret, directory);
+  const installations = new InstallationService(store.database);
   const admin = new AdminService(store, options.adminEmails ?? [], relay.online, !!directory, options.adminAd);
   server.requestTimeout = 15e3;
   server.headersTimeout = 1e4;
@@ -1777,8 +2016,8 @@ async function readBody(req, limit = 16384) {
 }
 
 // apps/api/src/admin-ad.ts
-var import_node_crypto9 = require("node:crypto");
-var sid = /^S-1-5-21-\d+-\d+-\d+-\d+$/;
+var import_node_crypto10 = require("node:crypto");
+var sid2 = /^S-1-5-21-\d+-\d+-\d+-\d+$/;
 var guid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 function object(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("object");
@@ -1790,7 +2029,7 @@ function decode(value, max) {
   if (data.toString("base64url") !== value) throw new Error("encoding");
   return data;
 }
-function text(value, max) {
+function text2(value, max) {
   return typeof value === "string" && value.length > 0 && value.length <= max && !/[\x00-\x1f\x7f]/.test(value);
 }
 var AdminAdVerifier = class {
@@ -1801,7 +2040,7 @@ var AdminAdVerifier = class {
   constructor(input) {
     try {
       const trust = object(input), uri = new URL(trust.issuer);
-      if (uri.protocol !== "https:" || uri.username || uri.password || uri.search || uri.hash || uri.pathname !== "/nodera-auth" || uri.href !== trust.issuer || trust.audience !== "urn:nodera:admin" || !sid.test(trust.groupSid)) throw new Error("trust");
+      if (uri.protocol !== "https:" || uri.username || uri.password || uri.search || uri.hash || uri.pathname !== "/nodera-auth" || uri.href !== trust.issuer || trust.audience !== "urn:nodera:admin" || !sid2.test(trust.groupSid)) throw new Error("trust");
       this.issuer = trust.issuer;
       this.audience = trust.audience;
       this.groupSid = trust.groupSid;
@@ -1812,7 +2051,7 @@ var AdminAdVerifier = class {
         if (Object.keys(key).some((k) => !["kty", "use", "alg", "kid", "n", "e"].includes(k)) || key.kty !== "RSA" || key.alg !== "RS256" || key.use !== "sig" || !/^[a-f0-9]{64}$/.test(key.kid) || this.keys.has(key.kid)) throw new Error("key");
         decode(key.n, 1400);
         decode(key.e, 12);
-        const publicKey = (0, import_node_crypto9.createPublicKey)({ key: { kty: "RSA", n: key.n, e: key.e }, format: "jwk" });
+        const publicKey = (0, import_node_crypto10.createPublicKey)({ key: { kty: "RSA", n: key.n, e: key.e }, format: "jwk" });
         const size = publicKey.asymmetricKeyDetails?.modulusLength ?? 0;
         if (publicKey.asymmetricKeyType !== "rsa" || size < 2048 || size > 8192) throw new Error("key size");
         this.keys.set(key.kid, publicKey);
@@ -1835,9 +2074,9 @@ var AdminAdVerifier = class {
       const header = object(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decode(parts[0], 1024))));
       if (Object.keys(header).some((k) => !["alg", "typ", "kid"].includes(k)) || header.alg !== "RS256" || header.typ !== "JWT") throw new Error("algorithm");
       const key = this.keys.get(header.kid);
-      if (!key || !(0, import_node_crypto9.verify)("RSA-SHA256", Buffer.from(parts[0] + "." + parts[1], "ascii"), key, decode(parts[2], 1400))) throw new Error("signature");
+      if (!key || !(0, import_node_crypto10.verify)("RSA-SHA256", Buffer.from(parts[0] + "." + parts[1], "ascii"), key, decode(parts[2], 1400))) throw new Error("signature");
       const claims = object(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decode(parts[1], 6e3))));
-      if (claims.iss !== this.issuer || claims.aud !== this.audience || !sid.test(claims.sub) || !guid.test(claims.jti) || ![claims.iat, claims.nbf, claims.exp].every(Number.isSafeInteger) || claims.iat > now + 30 || claims.nbf > now + 30 || claims.nbf !== claims.iat || claims.exp <= now || claims.exp <= claims.iat || claims.exp - claims.iat > 300 || now - claims.iat > 300 || !Array.isArray(claims.groups) || !claims.groups.includes(this.groupSid) || !Array.isArray(claims.amr) || !claims.amr.includes("pwd") || !claims.amr.includes("ad-network") || !text(claims.username, 80) || !/^NODERA\\[A-Za-z0-9][A-Za-z0-9._-]{0,19}$/i.test(claims.username) || !text(claims.name, 200)) throw new Error("claims");
+      if (claims.iss !== this.issuer || claims.aud !== this.audience || !sid2.test(claims.sub) || !guid.test(claims.jti) || ![claims.iat, claims.nbf, claims.exp].every(Number.isSafeInteger) || claims.iat > now + 30 || claims.nbf > now + 30 || claims.nbf !== claims.iat || claims.exp <= now || claims.exp <= claims.iat || claims.exp - claims.iat > 300 || now - claims.iat > 300 || !Array.isArray(claims.groups) || !claims.groups.includes(this.groupSid) || !Array.isArray(claims.amr) || !claims.amr.includes("pwd") || !claims.amr.includes("ad-network") || !text2(claims.username, 80) || !/^NODERA\\[A-Za-z0-9][A-Za-z0-9._-]{0,19}$/i.test(claims.username) || !text2(claims.name, 200)) throw new Error("claims");
       const user = { id: "ad:" + claims.sub, name: claims.name, email: "", username: claims.username, provider: "ad" };
       return { user, jti: claims.jti, kid: header.kid, proofExpiresAt: new Date(claims.exp * 1e3) };
     } catch {
