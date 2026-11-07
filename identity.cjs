@@ -7825,8 +7825,8 @@ var InstallationService = class {
     return request;
   }
   dto(r) {
-    const { _id: id, machineId, generation, computerName, machineName, leaseId, userId, userName, userEmail, windowsUsername: windowsUsername2, fileName, productName, version, publisher, signatureStatus, sha256, size, status, mode, reason, decidedBy, createdAt, decidedAt, expiresAt, completedAt, resultCode, exitCode, rebootRequired, source, appId, stage, downloadedBytes, totalBytes } = r;
-    return { id, machineId, generation, computerName, machineName, leaseId, userId, userName, userEmail, windowsUsername: windowsUsername2, fileName, productName, version, publisher, signatureStatus, sha256, size, status, mode, reason, decidedBy, createdAt, decidedAt, expiresAt, completedAt, resultCode, exitCode, rebootRequired, source, appId, stage, downloadedBytes, totalBytes };
+    const { _id: id, machineId, generation, computerName, machineName, leaseId, userId, userName, userEmail, windowsUsername: windowsUsername2, fileName, productName, version, publisher, signatureStatus, sha256, size, status, mode, reason, decidedBy, createdAt, decidedAt, expiresAt, completedAt, resultCode, exitCode, rebootRequired, source, appId, stage, downloadedBytes, totalBytes, catalogExecution: execution } = r;
+    return { id, machineId, generation, computerName, machineName, leaseId, userId, userName, userEmail, windowsUsername: windowsUsername2, fileName, productName, version, publisher, signatureStatus, sha256, size, status, mode, reason, decidedBy, createdAt, decidedAt, expiresAt, completedAt, resultCode, exitCode, rebootRequired, source, appId, stage, downloadedBytes, totalBytes, execution };
   }
   async submit(machine, body) {
     const { listing, account } = await this.lease(machine);
@@ -9112,8 +9112,9 @@ function catalogId(value) {
 }
 function validateRecipe(recipe) {
   const id = catalogId(recipe.appId), url = new URL(recipe.url);
+  if (recipe.execution !== void 0 && !["interactive", "silent"].includes(recipe.execution)) throw new Error("CATALOG_EXECUTION_INVALID");
   if (id.startsWith("winget:")) {
-    if (url.protocol !== "https:" || url.port || url.username || url.password || url.hash || !/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i.test(url.hostname) || /\.(local|internal|localhost)$/i.test(url.hostname) || /^[0-9.]+$/.test(url.hostname) || !/^[a-f0-9]{64}$/i.test(recipe.sha256) || !recipe.version || recipe.version.length > 120 || /[\x00-\x1f\x7f]/.test(recipe.version) || ![".exe", ".msi"].includes(recipe.extension) || !["msi", "inno", "nsis", "custom"].includes(recipe.mode) || recipe.extension === ".msi" && recipe.mode !== "msi" || recipe.mode === "msi" && recipe.extension !== ".msi" || typeof recipe.silentArgs !== "string" || !recipe.silentArgs.trim() || recipe.silentArgs.length > 2048 || /[\x00-\x1f\x7f<>]/.test(recipe.silentArgs) || !recipe.displayNames?.length || recipe.displayNames.length > 12 || recipe.displayNames.some((n) => typeof n !== "string" || !n.trim() || n.length > 240 || /[\x00-\x1f\x7f]/.test(n)) || (recipe.productCodes ?? []).some((n) => typeof n !== "string" || n.length > 240 || /[\x00-\x1f\x7f]/.test(n))) throw new Error("CATALOG_RECIPE_INVALID");
+    if (url.protocol !== "https:" || url.port || url.username || url.password || url.hash || !/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i.test(url.hostname) || /\.(local|internal|localhost)$/i.test(url.hostname) || /^[0-9.]+$/.test(url.hostname) || !/^[a-f0-9]{64}$/i.test(recipe.sha256) || !recipe.version || recipe.version.length > 120 || /[\x00-\x1f\x7f]/.test(recipe.version) || ![".exe", ".msi"].includes(recipe.extension) || !["msi", "inno", "nsis", "custom"].includes(recipe.mode) || recipe.extension === ".msi" && recipe.mode !== "msi" || recipe.mode === "msi" && recipe.extension !== ".msi" || recipe.execution !== "interactive" && (typeof recipe.silentArgs !== "string" || !recipe.silentArgs.trim()) || recipe.silentArgs !== void 0 && (typeof recipe.silentArgs !== "string" || recipe.silentArgs.length > 2048 || /[\x00-\x1f\x7f<>]/.test(recipe.silentArgs)) || !recipe.displayNames?.length || recipe.displayNames.length > 12 || recipe.displayNames.some((n) => typeof n !== "string" || !n.trim() || n.length > 240 || /[\x00-\x1f\x7f]/.test(n)) || (recipe.productCodes ?? []).some((n) => typeof n !== "string" || n.length > 240 || /[\x00-\x1f\x7f]/.test(n))) throw new Error("CATALOG_RECIPE_INVALID");
     return { ...recipe, sha256: recipe.sha256.toLowerCase() };
   }
   const builtin = id;
@@ -9342,23 +9343,35 @@ function buildWingetProfile(row, manifest, locale) {
   if (!manifest || manifest.PackageIdentifier !== row.packageId || String(manifest.PackageVersion) !== row.version || !Array.isArray(manifest.Installers)) return fail("Paketin kurulum tan\u0131m\u0131 bulunamad\u0131. Kullan\u0131c\u0131 manuel kurulum iste\u011Fi g\xF6nderebilir.");
   const candidates = manifest.Installers.map((entry) => ({ ...manifest, ...entry, InstallerSwitches: { ...manifest.InstallerSwitches, ...entry.InstallerSwitches }, Dependencies: { ...manifest.Dependencies, ...entry.Dependencies } })).filter((i) => ["x64", "x86", "neutral"].includes(i.Architecture) && i.Scope === "machine");
   candidates.sort((a, b) => ["x64", "x86", "neutral"].indexOf(a.Architecture) - ["x64", "x86", "neutral"].indexOf(b.Architecture));
+  const recipes = {};
+  let architecture, installerType;
   for (const i of candidates) {
     const type = i.InstallerType;
-    if (!["msi", "wix", "inno", "nullsoft", "exe", "burn", "installshield"].includes(type) || i.InstallModes && !i.InstallModes.some((m) => ["silent", "silentWithProgress"].includes(m)) || Object.values(i.Dependencies ?? {}).some((v) => Array.isArray(v) && v.length > 0)) continue;
+    if (!["msi", "wix", "inno", "nullsoft", "exe", "burn", "installshield"].includes(type) || i.InstallModes && !Array.isArray(i.InstallModes) || Object.values(i.Dependencies ?? {}).some((v) => Array.isArray(v) && v.length > 0)) continue;
     const extension = ["msi", "wix"].includes(type) ? ".msi" : ".exe", mode = extension === ".msi" ? "msi" : type === "inno" ? "inno" : type === "nullsoft" ? "nsis" : "custom";
     const switches = i.InstallerSwitches ?? {}, silent = switches.Silent || switches.SilentWithProgress || (mode === "msi" ? "/qn /norestart REBOOT=ReallySuppress ALLUSERS=1" : mode === "inno" ? "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /ALLUSERS" : mode === "nsis" ? "/S" : "");
-    if (typeof silent !== "string" || !silent.trim() || switches.Custom && typeof switches.Custom !== "string") continue;
     const args = [silent, switches.Custom].filter(Boolean).join(" ");
     const features = Array.isArray(i.AppsAndFeaturesEntries) ? i.AppsAndFeaturesEntries : [];
     const displayNames = [...new Set([app.name, ...features.map((f) => plain(f.DisplayName, 240))].filter(Boolean))].slice(0, 12);
     const productCodes = [...new Set([plain(i.ProductCode, 240), ...features.map((f) => plain(f.ProductCode, 240))].filter(Boolean))].slice(0, 12);
-    try {
-      const recipe = validateRecipe({ appId: app.id, version: row.version, url: i.InstallerUrl, sha256: i.InstallerSha256, extension, mode, silentArgs: args, displayNames, productCodes });
-      return { app, supported: true, recipe, architecture: i.Architecture, installerType: type };
-    } catch {
+    for (const execution of ["interactive", "silent"]) {
+      if (recipes[execution] || i.InstallModes && !i.InstallModes.some((m) => execution === "interactive" ? m === "interactive" : ["silent", "silentWithProgress"].includes(m))) continue;
+      if (execution === "silent" && (typeof silent !== "string" || !silent.trim() || switches.Custom && typeof switches.Custom !== "string")) continue;
+      try {
+        const recipe2 = validateRecipe({ appId: app.id, version: row.version, url: i.InstallerUrl, sha256: i.InstallerSha256, extension, mode, execution, architecture: i.Architecture, installerType: type, ...execution === "silent" ? { silentArgs: args } : {}, displayNames, productCodes });
+        recipes[execution] = recipe2;
+        if (!architecture || execution === "interactive") {
+          architecture = i.Architecture;
+          installerType = type;
+        }
+      } catch {
+      }
     }
   }
-  return fail("Bu pakette desteklenen bilgisayar geneli sessiz EXE/MSI kurulumu yok veya ek ba\u011F\u0131ml\u0131l\u0131k gerekiyor. Kullan\u0131c\u0131 manuel kurulum iste\u011Fi g\xF6nderebilir.");
+  const executions = ["interactive", "silent"].filter((e) => recipes[e]);
+  const recipe = recipes.interactive ?? recipes.silent;
+  if (recipe) return { app: { ...app, execution: recipe.execution, executions }, supported: true, recipe, recipes, executions, architecture, installerType };
+  return fail("Bu pakette desteklenen bilgisayar geneli EXE/MSI kurulumu yok veya ek ba\u011F\u0131ml\u0131l\u0131k gerekiyor. Kullan\u0131c\u0131 manuel kurulum iste\u011Fi g\xF6nderebilir.");
 }
 
 // apps/api/src/catalog.ts
@@ -9379,7 +9392,7 @@ var CatalogService = class {
   }
   async apps() {
     const settings = await this.db.collection("application_catalog").find({}).toArray();
-    return [...catalogApps.map((app) => ({ ...app, enabled: settings.find((s) => s._id === app.id)?.enabled !== false })), ...settings.filter((s) => s._id.startsWith("winget:") && s.app && s.recipe).map((s) => ({ ...s.app, enabled: s.enabled === true }))];
+    return [...catalogApps.map((app) => ({ ...app, enabled: settings.find((s) => s._id === app.id)?.enabled !== false, execution: settings.find((s) => s._id === app.id)?.execution ?? "interactive", executions: ["interactive", "silent"] })), ...settings.filter((s) => s._id.startsWith("winget:") && s.app && s.recipe).map((s) => ({ ...s.app, enabled: s.enabled === true, needsReview: !s.recipes }))];
   }
   async search(query) {
     const q = (query.get("q") ?? "").trim(), page = Number(query.get("page") ?? 1);
@@ -9405,23 +9418,26 @@ var CatalogService = class {
     if (!profile.supported || !profile.recipe) return profile;
     const previewId = (0, import_node_crypto9.randomUUID)(), expiresAt = new Date(Date.now() + 15 * 6e4);
     await this.db.collection("catalog_previews").insertOne({ _id: previewId, adminId: admin.id, ...profile, expiresAt });
-    return { app: profile.app, supported: true, previewId, expiresAt: expiresAt.toISOString(), architecture: profile.architecture, installerType: profile.installerType, scope: "machine", sha256: profile.recipe.sha256, sourceHost: new URL(profile.recipe.url).hostname };
+    const variants = Object.fromEntries(Object.entries(profile.recipes ?? {}).map(([execution, recipe]) => [execution, { sha256: recipe.sha256, sourceHost: new URL(recipe.url).hostname, architecture: recipe.architecture, installerType: recipe.installerType }]));
+    return { app: profile.app, supported: true, previewId, expiresAt: expiresAt.toISOString(), architecture: profile.architecture, installerType: profile.installerType, scope: "machine", sha256: profile.recipe.sha256, sourceHost: new URL(profile.recipe.url).hostname, executions: profile.executions, variants };
   }
   async configure(appId, admin, body) {
     const id = catalogId(appId);
-    if (Object.keys(body).some((k) => !["enabled", "previewId"].includes(k)) || typeof body.enabled !== "boolean" || !id.startsWith("winget:") && body.previewId !== void 0) throw new HttpError(400, "Yaln\u0131zca ma\u011Fazada sunulacak uygulamalar se\xE7ilebilir.");
+    if (Object.keys(body).some((k) => !["enabled", "previewId", "execution"].includes(k)) || typeof body.enabled !== "boolean" || !id.startsWith("winget:") && body.previewId !== void 0 || body.execution !== void 0 && !["interactive", "silent"].includes(String(body.execution))) throw new HttpError(400, "Ma\u011Faza kurulum se\xE7imi ge\xE7ersiz.");
     let reviewed = {};
     if (id.startsWith("winget:")) {
       const current = await this.db.collection("application_catalog").findOne({ _id: id });
-      if (body.previewId !== void 0) {
+      if (body.previewId !== void 0 || body.execution !== void 0) {
         if (typeof body.previewId !== "string" || !/^[a-f0-9-]{36}$/.test(body.previewId)) throw new HttpError(400, "\u0130nceleme kimli\u011Fi ge\xE7ersiz.");
         const preview = await this.db.collection("catalog_previews").findOne({ _id: body.previewId, adminId: admin.id, "app.id": id, expiresAt: { $gt: /* @__PURE__ */ new Date() } });
-        if (!preview?.supported || !preview.recipe) throw new HttpError(409, "\u0130nceleme s\xFCresi doldu veya paket e\u015Fle\u015Fmiyor. Uygulamay\u0131 yeniden incele.");
-        const recipe = validateRecipe(preview.recipe), revision = (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify(recipe)).digest("hex");
-        reviewed = { app: { ...preview.app, reviewedAt: (/* @__PURE__ */ new Date()).toISOString() }, recipe, revision };
+        if (!preview?.supported || !preview.recipes) throw new HttpError(409, "\u0130nceleme s\xFCresi doldu veya paket e\u015Fle\u015Fmiyor. Uygulamay\u0131 yeniden incele.");
+        const execution = String(body.execution ?? preview.app.execution ?? "interactive");
+        if (!preview.recipes[execution]) throw new HttpError(409, "Bu paket se\xE7ilen kurulum y\xF6ntemini desteklemiyor.");
+        const recipe = validateRecipe(preview.recipes[execution]), revision = (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify(recipe)).digest("hex");
+        reviewed = { app: { ...preview.app, execution, reviewedAt: (/* @__PURE__ */ new Date()).toISOString() }, recipes: preview.recipes, recipe, revision };
       } else if (!current?.recipe || !current.app) throw new HttpError(409, "Uygulamay\u0131 yay\u0131mlamadan \xF6nce katalogdan se\xE7ip incele.");
     }
-    await this.db.collection("application_catalog").updateOne({ _id: id }, { $set: { ...reviewed, enabled: body.enabled, updatedAt: /* @__PURE__ */ new Date(), updatedBy: { id: admin.id, name: admin.name } } }, { upsert: true });
+    await this.db.collection("application_catalog").updateOne({ _id: id }, { $set: { ...reviewed, ...!id.startsWith("winget:") && body.execution !== void 0 ? { execution: body.execution } : {}, enabled: body.enabled, updatedAt: /* @__PURE__ */ new Date(), updatedBy: { id: admin.id, name: admin.name } } }, { upsert: true });
     return { apps: await this.apps() };
   }
   ready(machine) {
@@ -9455,7 +9471,9 @@ var CatalogService = class {
     const { listing, machine, account } = await this.rental(user, body.leaseId);
     if (!this.ready(machine)) throw new HttpError(409, "VM'nin ma\u011Faza arac\u0131s\u0131na ula\u015F\u0131lam\u0131yor. Makine sahibi kurulum arac\u0131s\u0131n\u0131 g\xFCncelleyip VM'yi a\xE7\u0131k tutmal\u0131.");
     const selected = appId.startsWith("winget:") ? await this.db.collection("application_catalog").findOne({ _id: appId, enabled: true }) : null;
-    if (appId.startsWith("winget:") && (!selected?.recipe || machine.installCatalogProtocol !== 2)) throw new HttpError(409, "Bu uygulama i\xE7in VM'nin kurulum arac\u0131s\u0131 g\xFCncellenmeli.");
+    const execution = app.execution ?? "interactive";
+    if (selected && !selected.recipes) throw new HttpError(409, "Y\xF6netici bu uygulaman\u0131n kurulum y\xF6ntemini yeniden inceleyip yay\u0131mlamal\u0131.");
+    if (appId.startsWith("winget:") && (!selected?.recipe || (machine.installCatalogProtocol ?? 1) < 2) || execution === "interactive" && (machine.installCatalogProtocol ?? 1) < 3) throw new HttpError(409, "Bu kurulum i\xE7in VM'nin kurulum arac\u0131s\u0131 g\xFCncellenmeli.");
     const identity = { source: "catalog", appId, machineId: machine.machineId, generation: machine.generation, leaseId: listing.lease.id };
     const existing = await this.requests.findOne({ ...identity, status: { $in: ["approved", "running", "succeeded"] } });
     if (existing) {
@@ -9487,6 +9505,7 @@ var CatalogService = class {
       expiresAt,
       approvalExpiresAt: expiresAt,
       deleteAfter: new Date(Date.now() + 90 * 864e5),
+      catalogExecution: execution,
       ...selected ? { catalogRevision: selected.revision, catalogRecipe: validateRecipe(selected.recipe) } : {}
     };
     try {
@@ -9498,12 +9517,12 @@ var CatalogService = class {
     return { request: this.installations.dto(request) };
   }
   async claim(machine, body = {}) {
-    if (body.catalogProtocol !== void 0 && ![1, 2].includes(Number(body.catalogProtocol))) throw new HttpError(400, "Ma\u011Faza arac\u0131 s\xFCr\xFCm\xFC ge\xE7ersiz.");
-    const protocol = body.catalogProtocol === 2 ? 2 : 1;
+    if (body.catalogProtocol !== void 0 && ![1, 2, 3].includes(body.catalogProtocol)) throw new HttpError(400, "Ma\u011Faza arac\u0131 s\xFCr\xFCm\xFC ge\xE7ersiz.");
+    const protocol = body.catalogProtocol === 3 ? 3 : body.catalogProtocol === 2 ? 2 : 1;
     await this.db.collection("directory_machines").updateOne({ _id: machine.machineId, generation: machine.generation }, { $set: { installCatalogSeenAt: /* @__PURE__ */ new Date(), installCatalogProtocol: protocol } });
     const requests = await this.requests.find({ source: "catalog", machineId: machine.machineId, generation: machine.generation, status: "approved" }).sort({ createdAt: 1 }).limit(10).toArray();
     for (const queued of requests) {
-      if (queued.appId.startsWith("winget:") && protocol !== 2) continue;
+      if (queued.appId.startsWith("winget:") && protocol < 2 || queued.catalogExecution === "interactive" && protocol < 3) continue;
       const r = await this.installations.invalidate(queued);
       if (r.status !== "approved") continue;
       let recipe;
@@ -9514,6 +9533,7 @@ var CatalogService = class {
         await recordDiagnostic(this.db, { id: r._id, userId: r.userId, machineId: r.machineId, leaseId: r.leaseId, source: "api", category: "installation", operation: "catalog-metadata", code: "ND_APP_CATALOG_METADATA", message: "Uygulaman\u0131n resm\xEE s\xFCr\xFCm bilgisi al\u0131namad\u0131. Ma\u011Fazadan yeniden deneyin." });
         continue;
       }
+      recipe = validateRecipe({ ...recipe, execution: r.catalogExecution ?? recipe.execution ?? "silent" });
       try {
         await this.installations.valid(r);
       } catch {
@@ -9527,7 +9547,7 @@ var CatalogService = class {
     return { job: null };
   }
   async progress(machine, id, body) {
-    const r = await this.installations.running(machine, id, body.claim), phases = ["downloading", "verifying", "installing"];
+    const r = await this.installations.running(machine, id, body.claim), phases = r.catalogExecution === "interactive" ? ["downloading", "verifying", "waiting_user", "installing"] : ["downloading", "verifying", "installing"];
     const index = phases.indexOf(String(body.stage));
     if (r.source !== "catalog" || index < 0 || index < phases.indexOf(r.stage) || index > phases.indexOf(r.stage) + 1 || !Number.isSafeInteger(body.downloadedBytes) || Number(body.downloadedBytes) < (r.downloadedBytes ?? 0) || Number(body.downloadedBytes) > 2 * 1024 ** 3 || body.totalBytes !== void 0 && (!Number.isSafeInteger(body.totalBytes) || Number(body.totalBytes) < Number(body.downloadedBytes) || Number(body.totalBytes) > 2 * 1024 ** 3)) throw new HttpError(400, "Kurulum a\u015Famas\u0131 ge\xE7ersiz.");
     await this.requests.updateOne({ _id: r._id, status: "running", claimHash: r.claimHash }, { $set: { stage: body.stage, downloadedBytes: body.downloadedBytes, ...body.totalBytes ? { totalBytes: body.totalBytes } : {}, progressAt: /* @__PURE__ */ new Date() } });
@@ -9561,7 +9581,7 @@ function createIdentityServer(store, options) {
           status: "ok",
           service: "nodera-identity",
           version: "0.5.0",
-          capabilities: ["marketplace", "rdp-relay", "admin-monitoring-v1", "host-inventory-v1", "installation-approval-v1", "application-catalog-v1", "winget-catalog-v2", ...options.adminAd ? ["admin-ad-auth-v1"] : [], ...directory ? ["directory-v1", "directory-marketplace-v1", "windows-account-profile-v1"] : []]
+          capabilities: ["marketplace", "rdp-relay", "admin-monitoring-v1", "host-inventory-v1", "installation-approval-v1", "application-catalog-v1", "winget-catalog-v2", "catalog-interactive-v3", ...options.adminAd ? ["admin-ad-auth-v1"] : [], ...directory ? ["directory-v1", "directory-marketplace-v1", "windows-account-profile-v1"] : []]
         });
         return;
       }
